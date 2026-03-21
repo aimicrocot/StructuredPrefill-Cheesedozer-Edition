@@ -931,16 +931,36 @@ async function applyPrefillGeneratorToRequest({
     skip = false,
 }) {
     const target = findPrefillGeneratorTarget(targetUrl, jsonBody);
-    if (!target || !templateHasPrefillGenSlot(target.prefill) || skip) {
+    const hasSlot = Boolean(target && templateHasPrefillGenSlot(target.prefill));
+    const debug = {
+        attempted: false,
+        applied: false,
+        skipped: Boolean(skip),
+        reason: !target ? 'no_trailing_prefill' : (!hasSlot ? 'no_pg_slot' : (skip ? 'continue_skip' : '')),
+        sourceProvider: target?.provider ?? '',
+        sourceTargetUrl: String(targetUrl ?? ''),
+        sourceModel: extractModelFromRequest(targetUrl, jsonBody),
+        sourcePrefill: String(target?.prefill ?? ''),
+        generatorProvider: '',
+        generatorTargetUrl: '',
+        generatorModel: '',
+        requestBody: null,
+        generatedText: '',
+        error: '',
+    };
+
+    if (!target || !hasSlot || skip) {
         return {
             applied: false,
             jsonBody,
             provider: target?.provider ?? '',
+            debug,
         };
     }
 
     let generatedText = '';
     let generatorProvider = target.provider;
+    debug.attempted = true;
     if (config?.enabled) {
         try {
             const normalizedConfig = {
@@ -965,6 +985,10 @@ async function applyPrefillGeneratorToRequest({
                 config: normalizedConfig,
             });
             generatorProvider = generatorRequest.provider;
+            debug.generatorProvider = generatorRequest.provider;
+            debug.generatorTargetUrl = generatorRequest.targetUrl.toString();
+            debug.generatorModel = extractModelFromRequest(generatorRequest.targetUrl, generatorRequest.jsonBody);
+            debug.requestBody = cloneJson(generatorRequest.jsonBody);
 
             generatedText = await runPrefillGenerator({
                 targetUrl: generatorRequest.targetUrl,
@@ -976,15 +1000,16 @@ async function applyPrefillGeneratorToRequest({
                 stopStrings: generatorRequest.stopStrings,
                 fetchImpl,
             });
+            debug.reason = 'ok';
         } catch (error) {
-            try {
-                console.warn('[structured-prefill-proxy] prefill generator failed:', error);
-            } catch {
-                // ignore console failures
-            }
+            debug.reason = 'error';
+            debug.error = String(error?.message ?? error);
             generatedText = '';
         }
+    } else {
+        debug.reason = 'disabled';
     }
+    debug.generatedText = generatedText;
 
     const nextPrefill = String(target.prefill ?? '').replace(PREFILL_GEN_SLOT_REGEX, String(generatedText ?? ''));
     return {
@@ -992,6 +1017,10 @@ async function applyPrefillGeneratorToRequest({
         jsonBody: replacePrefillInRequest(jsonBody, target, nextPrefill),
         provider: generatorProvider,
         generatedText,
+        debug: {
+            ...debug,
+            applied: true,
+        },
     };
 }
 

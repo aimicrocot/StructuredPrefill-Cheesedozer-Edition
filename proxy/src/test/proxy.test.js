@@ -86,9 +86,25 @@ test('anti-slop bans configured words from the continuation pattern', () => {
     });
 
     const pattern = new RegExp(schema.properties.response.pattern);
-    assert.equal(pattern.test('Hello waves'), true);
+    assert.equal(pattern.test('Hello puppy'), true);
     assert.equal(pattern.test('Hello gaze'), false);
     assert.equal(pattern.test('Hello smirked'), false);
+});
+
+test('anti-slop regex shape matches the extension for anthropic-safe simple bans', () => {
+    const schema = buildPatternResponseSchema('Hello ', {
+        minCharsAfterPrefix: 1,
+        newlineToken: '\\n',
+        patternMode: 'anthropic',
+        knownNames: [],
+        antiSlopBanList: 'gaze',
+        mustEndAfterTemplate: false,
+    });
+
+    assert.equal(
+        schema.properties.response.pattern,
+        '^(?:Hello )([^gG]|[Gg]([^aA]|[Aa]([^zZ]|[Zz]([^eE]))))+$',
+    );
 });
 
 test('openai chat requests are rewritten into response_format json_schema', () => {
@@ -119,6 +135,60 @@ test('openai chat requests are rewritten into response_format json_schema', () =
     assert.equal(rewritten.jsonBody.messages.length, 1);
     assert.equal(rewritten.jsonBody.response_format.type, 'json_schema');
     assert.equal(rewritten.jsonBody.response_format.json_schema.name, 'response');
+});
+
+test('openai chat strips known character-name prefixes from prior message content', () => {
+    const targetUrl = new URL('https://api.openai.com/v1/chat/completions');
+    const body = {
+        model: 'gpt-4.1',
+        messages: [
+            { role: 'user', content: 'User: Continue.' },
+            { role: 'assistant', content: 'Mara: Previous reply.' },
+            { role: 'assistant', content: 'Mara: Hello there, ' },
+        ],
+    };
+
+    const rewritten = rewriteProxyJsonRequest({
+        targetUrl,
+        jsonBody: body,
+        baseConfig: {
+            enabled: true,
+            minCharsAfterPrefix: 8,
+            newlineToken: '\\n',
+            hidePrefillInDisplay: true,
+        },
+    });
+
+    assert.ok(rewritten);
+    assert.equal(rewritten.context.prefillTemplate, 'Hello there, ');
+    assert.equal(rewritten.jsonBody.messages.length, 2);
+    assert.equal(rewritten.jsonBody.response_format.json_schema.schema.properties.response.pattern.startsWith('^(?:Hello there, )'), true);
+});
+
+test('openai chat does not strip arbitrary colon-prefixed prefills without a prior known name', () => {
+    const targetUrl = new URL('https://api.openai.com/v1/chat/completions');
+    const body = {
+        model: 'gpt-4.1',
+        messages: [
+            { role: 'user', content: 'Continue.' },
+            { role: 'assistant', content: 'Status: nominal' },
+        ],
+    };
+
+    const rewritten = rewriteProxyJsonRequest({
+        targetUrl,
+        jsonBody: body,
+        baseConfig: {
+            enabled: true,
+            minCharsAfterPrefix: 8,
+            newlineToken: '\\n',
+            hidePrefillInDisplay: true,
+        },
+    });
+
+    assert.ok(rewritten);
+    assert.equal(rewritten.context.prefillTemplate, 'Status: nominal');
+    assert.equal(rewritten.jsonBody.response_format.json_schema.schema.properties.response.pattern.startsWith('^(?:Status: nominal)'), true);
 });
 
 test('gpt-5.4 chat requests normalize max_tokens into max_completion_tokens', () => {
@@ -281,6 +351,36 @@ test('continue force mode keeps the assistant turn and joins overlap-stripped ou
     });
 
     assert.equal(rewrittenResponse.choices[0].message.content, 'Hello world');
+});
+
+test('continue rewrites strip known character-name prefixes from prior message content', () => {
+    const targetUrl = new URL('https://api.openai.com/v1/chat/completions');
+    const body = {
+        model: 'gpt-4.1',
+        messages: [
+            { role: 'assistant', content: 'Mara: Earlier line' },
+            { role: 'assistant', content: 'Mara: Hello wor' },
+            { role: 'system', content: '[Continue your last message without repeating its original content.]' },
+        ],
+    };
+
+    const rewritten = rewriteProxyJsonRequest({
+        targetUrl,
+        jsonBody: body,
+        baseConfig: {
+            enabled: true,
+            minCharsAfterPrefix: 80,
+            newlineToken: '\\n',
+            hidePrefillInDisplay: true,
+            continueMode: 'auto',
+            continueOverlapChars: 3,
+        },
+    });
+
+    assert.ok(rewritten);
+    assert.equal(rewritten.context.continue.active, true);
+    assert.equal(rewritten.context.continue.baseText, 'Hello wor');
+    assert.equal(rewritten.jsonBody.messages[1].content, 'Hello wor');
 });
 
 test('continue auto mode activates from a trailing continue instruction', () => {
@@ -1288,6 +1388,10 @@ test('prefill generator replaces [[pg]] in openai chat requests using the same u
     assert.deepEqual(capturedPayload.messages, [
         { role: 'user', content: 'Write the opener.' },
     ]);
+    assert.equal(rewritten.debug.generatorModel, 'gpt-4o-mini');
+    assert.equal(rewritten.debug.generatorTargetUrl, 'https://api.openai.com/v1/chat/completions');
+    assert.equal(rewritten.debug.requestBody.model, 'gpt-4o-mini');
+    assert.equal(rewritten.debug.generatedText, 'brooding');
     assert.equal(rewritten.jsonBody.messages[1].content, 'Mood: brooding\nScene: ');
 });
 
@@ -1354,6 +1458,8 @@ test('prefill generator can use a separate anthropic target and api key', async 
     assert.equal(capturedPayload.system, 'You are terse.');
     assert.deepEqual(capturedPayload.stop_sequences, ['END']);
     assert.equal(rewritten.provider, 'anthropic-messages');
+    assert.equal(rewritten.debug.generatorModel, 'claude-sonnet-4-5');
+    assert.equal(rewritten.debug.requestBody.model, 'claude-sonnet-4-5');
     assert.equal(rewritten.jsonBody.messages[2].content, 'Mood: brooding\nScene: ');
 });
 
@@ -1387,6 +1493,8 @@ test('prefill generator strips [[pg]] to empty when disabled', async () => {
     });
 
     assert.equal(rewritten.applied, true);
+    assert.equal(rewritten.debug.reason, 'disabled');
+    assert.equal(rewritten.debug.generatedText, '');
     assert.equal(rewritten.jsonBody.messages[1].content, 'Mood: \nScene: ');
 });
 
@@ -1445,5 +1553,126 @@ test('prefill generator uses non-stream gemini generateContent and can override 
     assert.deepEqual(capturedPayload.contents, [
         { role: 'user', parts: [{ text: 'Finish the line.' }] },
     ]);
+    assert.equal(rewritten.debug.generatorModel, 'gemini-2.5-pro');
+    assert.equal(rewritten.debug.generatorTargetUrl, 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent?key=test');
     assert.deepEqual(rewritten.jsonBody.contents[1].parts, [{ text: 'Prefix: focused\nAnswer: ' }]);
+});
+
+test('debug endpoint exposes the last prefill-generator model and regex payload', async (t) => {
+    const upstream = http.createServer(async (req, res) => {
+        const body = JSON.parse(String(await new Promise((resolve, reject) => {
+            const chunks = [];
+            req.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
+            req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+            req.on('error', reject);
+        }) || '{}'));
+
+        res.statusCode = 200;
+        res.setHeader('Content-Type', 'application/json');
+
+        if (body.response_format?.json_schema) {
+            res.end(JSON.stringify({
+                choices: [
+                    {
+                        message: {
+                            role: 'assistant',
+                            content: '{"response":"Mood: grim\\nScene: opening line"}',
+                        },
+                    },
+                ],
+            }));
+            return;
+        }
+
+        res.end(JSON.stringify({
+            choices: [
+                {
+                    message: {
+                        role: 'assistant',
+                        content: 'grim',
+                    },
+                },
+            ],
+        }));
+    });
+    await new Promise((resolve, reject) => {
+        upstream.once('error', reject);
+        upstream.listen(0, '127.0.0.1', resolve);
+    });
+    t.after(() => upstream.close());
+    const upstreamAddress = upstream.address();
+    const upstreamPort = upstreamAddress && typeof upstreamAddress === 'object' ? upstreamAddress.port : 0;
+
+    const proxyPort = await getFreePort();
+    const proxyDir = fs.mkdtempSync(path.join(os.tmpdir(), 'structured-prefill-proxy-debug-'));
+    fs.writeFileSync(path.join(proxyDir, 'config.yaml'), [
+        'server:',
+        '  host: 127.0.0.1',
+        `  port: ${proxyPort}`,
+        'routing:',
+        `  openai_base_url: "http://127.0.0.1:${upstreamPort}"`,
+        `  openrouter_base_url: "http://127.0.0.1:${upstreamPort}"`,
+        `  openai_compatible_base_url: "http://127.0.0.1:${upstreamPort}"`,
+        `  anthropic_base_url: "http://127.0.0.1:${upstreamPort}"`,
+        `  google_base_url: "http://127.0.0.1:${upstreamPort}"`,
+        'structured_prefill:',
+        '  enabled: true',
+        '  min_chars_after_prefix: 8',
+        "  newline_token: '\\n'",
+        '  hide_prefill_in_display: true',
+        '  anti_slop_ban_list: ""',
+        '  continue:',
+        '    mode: "off"',
+        '    overlap_chars: 14',
+        '  prefill_generator:',
+        '    enabled: true',
+        '    provider: "auto"',
+        '    target_url: ""',
+        '    api_key: ""',
+        '    api_key_header: ""',
+        '    api_key_prefix: ""',
+        '    extra_headers: ""',
+        '    model: "mistral-small-latest"',
+        '    max_tokens: 12',
+        '    timeout_ms: 5000',
+        '    stop: ""',
+        '    keep_matched_stop_string: false',
+        '    extra_prompt: ""',
+        '    extra_prompt_role: "system"',
+    ].join('\n'), 'utf8');
+
+    const proxy = startServer({
+        proxyDir,
+        logger: {
+            log() {},
+            warn() {},
+        },
+    });
+    t.after(() => proxy.close());
+    await waitForListening(proxy);
+
+    const response = await fetch(`http://127.0.0.1:${proxyPort}/openai/v1/chat/completions`, {
+        method: 'POST',
+        headers: {
+            'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+            model: 'anthropic/claude-opus-4.6',
+            messages: [
+                { role: 'user', content: 'Write the opener.' },
+                { role: 'assistant', content: 'Mood: [[pg]]\nScene: ' },
+            ],
+        }),
+    });
+
+    assert.equal(response.status, 200);
+    const debugResponse = await fetch(`http://127.0.0.1:${proxyPort}/__debug/last`);
+    assert.equal(debugResponse.status, 200);
+    const debug = await debugResponse.json();
+
+    assert.equal(debug.prefill_generator.generatorModel, 'mistral-small-latest');
+    assert.equal(debug.prefill_generator.requestBody.model, 'mistral-small-latest');
+    assert.equal(debug.prefill_generator.generatedText, 'grim');
+    assert.match(debug.structured_prefill.response_schema.properties.response.pattern, /\^\(\?:Mood: grim/);
+    assert.equal(debug.structured_prefill.request_body.response_format.json_schema.name, 'response');
 });

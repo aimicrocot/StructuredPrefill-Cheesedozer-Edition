@@ -416,7 +416,11 @@ function buildAntiSlopContinuation(banListStr) {
 
             const charExpr = hasCase ? `[${upper}${lower}]` : escapeClassChar(key);
             const sub = toRegex(child);
-            branches.push(sub ? `${charExpr}(?:$|${sub})` : charExpr);
+            if (sub) {
+                branches.push(`${charExpr}${sub}`);
+            } else {
+                branches.push(charExpr);
+            }
         }
 
         return `([^${excludes.join('')}]${branches.length > 0 ? `|${branches.join('|')}` : ''})`;
@@ -1122,6 +1126,125 @@ function collectKnownNamesFromResponsesInput(input) {
     return [...names];
 }
 
+function collectLeadingContentPrefixes(items, extractText, extractRole, shouldInclude) {
+    const names = new Set();
+    if (!Array.isArray(items)) return [];
+
+    for (let index = 0; index < items.length; index++) {
+        const item = items[index];
+        if (!item || typeof item !== 'object') continue;
+        if (typeof shouldInclude === 'function' && !shouldInclude(item, index)) continue;
+        const role = String(extractRole(item) ?? '').toLowerCase();
+        if (role === 'system') continue;
+
+        const text = normalizeNewlines(String(extractText(item) ?? ''));
+        const match = /^([^:\n]{1,80}):\s/.exec(text);
+        if (!match) continue;
+
+        const name = String(match[1] ?? '').trim();
+        if (name) names.add(name);
+    }
+
+    return [...names];
+}
+
+function collectKnownNamesFromMessageContent(messages, options = {}) {
+    const excludeIndex = Number.isInteger(options?.excludeIndex) ? options.excludeIndex : -1;
+    return collectLeadingContentPrefixes(
+        messages,
+        (message) => extractPlainTextFromContent(message.content),
+        (message) => message.role,
+        (_message, index) => index !== excludeIndex,
+    );
+}
+
+function collectKnownNamesFromResponsesContent(input, options = {}) {
+    const excludeIndex = Number.isInteger(options?.excludeIndex) ? options.excludeIndex : -1;
+    return collectLeadingContentPrefixes(
+        input,
+        (item) => extractPlainTextFromContent(item.content),
+        (item) => item.role,
+        (_item, index) => index !== excludeIndex,
+    );
+}
+
+function collectKnownNamesFromGeminiContent(contents, options = {}) {
+    const excludeIndex = Number.isInteger(options?.excludeIndex) ? options.excludeIndex : -1;
+    return collectLeadingContentPrefixes(
+        contents,
+        (item) => extractPlainTextFromContent(item.parts),
+        (item) => String(item.role ?? '').toLowerCase() === 'model' ? 'assistant' : item.role,
+        (_item, index) => index !== excludeIndex,
+    );
+}
+
+function collectKnownNamesFromRequestMetadata(jsonBody) {
+    const names = new Set();
+    const pushName = (value) => {
+        const name = String(value ?? '').trim();
+        if (name) names.add(name);
+    };
+
+    pushName(jsonBody?.user_name);
+    pushName(jsonBody?.char_name);
+    for (const value of Array.isArray(jsonBody?.group_names) ? jsonBody.group_names : []) {
+        pushName(value);
+    }
+
+    return [...names];
+}
+
+function mergeKnownNames(...groups) {
+    const names = new Set();
+    for (const group of groups) {
+        for (const value of Array.isArray(group) ? group : []) {
+            const name = String(value ?? '').trim();
+            if (name) names.add(name);
+        }
+    }
+    return [...names];
+}
+
+function stripLeadingKnownNamePrefix(text, knownNames) {
+    const normalized = normalizeNewlines(String(text ?? ''));
+    if (!normalized) return normalized;
+
+    const names = [...new Set((Array.isArray(knownNames) ? knownNames : [])
+        .map((value) => String(value ?? '').trim())
+        .filter(Boolean))]
+        .sort((a, b) => b.length - a.length);
+
+    for (const name of names) {
+        if (name && normalized.startsWith(name + ': ')) {
+            return normalized.slice(name.length + 2);
+        }
+    }
+
+    return normalized;
+}
+
+function replacePlainTextContent(target, text) {
+    if (!target || typeof target !== 'object') return;
+    const value = String(text ?? '');
+
+    if (Object.prototype.hasOwnProperty.call(target, 'parts')) {
+        target.parts = [{ text: value }];
+        return;
+    }
+
+    if (typeof target.content === 'string' || target.content == null) {
+        target.content = value;
+        return;
+    }
+
+    if (Array.isArray(target.content)) {
+        target.content = [{ type: 'text', text: value }];
+        return;
+    }
+
+    target.content = value;
+}
+
 function findTrailingAssistantMessage(messages) {
     if (!Array.isArray(messages) || messages.length === 0) return null;
     for (let index = messages.length - 1; index >= 0; index--) {
@@ -1545,6 +1668,15 @@ function rewriteOpenAiChatRequest(targetUrl, jsonBody, config) {
     normalizeOpenAiChatModelRequest(rewritten);
     const trailing = findTrailingAssistantMessage(rewritten.messages);
     if (!trailing) return null;
+    const knownNames = mergeKnownNames(
+        collectKnownNamesFromMessages(rewritten.messages),
+        collectKnownNamesFromMessageContent(rewritten.messages, { excludeIndex: trailing.index }),
+        collectKnownNamesFromRequestMetadata(rewritten),
+    );
+    const normalizedPrefill = stripLeadingKnownNamePrefix(trailing.prefill, knownNames);
+    if (normalizedPrefill !== trailing.prefill) {
+        replacePlainTextContent(rewritten.messages[trailing.index], normalizedPrefill);
+    }
     const continueActive = detectContinueRequest({
         provider: 'openai-chat',
         jsonBody: rewritten,
@@ -1557,8 +1689,8 @@ function rewriteOpenAiChatRequest(targetUrl, jsonBody, config) {
         provider: 'openai-chat',
         targetUrl,
         modelId: rewritten.model,
-        prefillTemplate: trailing.prefill,
-        knownNames: collectKnownNamesFromMessages(rewritten.messages),
+        prefillTemplate: normalizedPrefill,
+        knownNames,
         config,
         continueActive,
     });
@@ -1587,6 +1719,15 @@ function rewriteOpenAiResponsesRequest(targetUrl, jsonBody, config) {
     const rewritten = cloneJson(jsonBody);
     const trailing = findTrailingAssistantResponsesInput(rewritten.input);
     if (!trailing) return null;
+    const knownNames = mergeKnownNames(
+        collectKnownNamesFromResponsesInput(rewritten.input),
+        collectKnownNamesFromResponsesContent(rewritten.input, { excludeIndex: trailing.index }),
+        collectKnownNamesFromRequestMetadata(rewritten),
+    );
+    const normalizedPrefill = stripLeadingKnownNamePrefix(trailing.prefill, knownNames);
+    if (normalizedPrefill !== trailing.prefill) {
+        replacePlainTextContent(rewritten.input[trailing.index], normalizedPrefill);
+    }
     const continueActive = detectContinueRequest({
         provider: 'openai-responses',
         jsonBody: rewritten,
@@ -1599,8 +1740,8 @@ function rewriteOpenAiResponsesRequest(targetUrl, jsonBody, config) {
         provider: 'openai-responses',
         targetUrl,
         modelId: rewritten.model,
-        prefillTemplate: trailing.prefill,
-        knownNames: collectKnownNamesFromResponsesInput(rewritten.input),
+        prefillTemplate: normalizedPrefill,
+        knownNames,
         config,
         continueActive,
     });
@@ -1630,6 +1771,15 @@ function rewriteAnthropicMessagesRequest(targetUrl, jsonBody, config) {
     const rewritten = cloneJson(jsonBody);
     const trailing = findTrailingAssistantMessage(rewritten.messages);
     if (!trailing) return null;
+    const knownNames = mergeKnownNames(
+        collectKnownNamesFromMessages(rewritten.messages),
+        collectKnownNamesFromMessageContent(rewritten.messages, { excludeIndex: trailing.index }),
+        collectKnownNamesFromRequestMetadata(rewritten),
+    );
+    const normalizedPrefill = stripLeadingKnownNamePrefix(trailing.prefill, knownNames);
+    if (normalizedPrefill !== trailing.prefill) {
+        replacePlainTextContent(rewritten.messages[trailing.index], normalizedPrefill);
+    }
     const continueActive = detectContinueRequest({
         provider: 'anthropic-messages',
         jsonBody: rewritten,
@@ -1642,8 +1792,8 @@ function rewriteAnthropicMessagesRequest(targetUrl, jsonBody, config) {
         provider: 'anthropic-messages',
         targetUrl,
         modelId: rewritten.model,
-        prefillTemplate: trailing.prefill,
-        knownNames: collectKnownNamesFromMessages(rewritten.messages),
+        prefillTemplate: normalizedPrefill,
+        knownNames,
         config,
         continueActive,
     });
@@ -1677,6 +1827,14 @@ function rewriteGeminiRequest(targetUrl, jsonBody, config) {
     const rewritten = cloneJson(jsonBody);
     const trailing = findTrailingGeminiModelContent(rewritten.contents);
     if (!trailing) return null;
+    const knownNames = mergeKnownNames(
+        collectKnownNamesFromGeminiContent(rewritten.contents, { excludeIndex: trailing.index }),
+        collectKnownNamesFromRequestMetadata(rewritten),
+    );
+    const normalizedPrefill = stripLeadingKnownNamePrefix(trailing.prefill, knownNames);
+    if (normalizedPrefill !== trailing.prefill) {
+        replacePlainTextContent(rewritten.contents[trailing.index], normalizedPrefill);
+    }
     const continueActive = detectContinueRequest({
         provider: 'gemini-generate-content',
         jsonBody: rewritten,
@@ -1689,8 +1847,8 @@ function rewriteGeminiRequest(targetUrl, jsonBody, config) {
         provider: 'gemini-generate-content',
         targetUrl,
         modelId: extractGeminiModelId(targetUrl),
-        prefillTemplate: trailing.prefill,
-        knownNames: [],
+        prefillTemplate: normalizedPrefill,
+        knownNames,
         config,
         continueActive,
     });

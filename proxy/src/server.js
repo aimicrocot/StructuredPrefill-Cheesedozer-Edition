@@ -143,6 +143,15 @@ function writeJson(res, statusCode, payload, corsOrigin = '') {
     res.end(buffer);
 }
 
+function writePrettyJson(res, statusCode, payload, corsOrigin = '') {
+    const buffer = Buffer.from(JSON.stringify(payload, null, 2));
+    res.statusCode = statusCode;
+    setCorsHeaders(res, corsOrigin);
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.setHeader('Content-Length', String(buffer.length));
+    res.end(buffer);
+}
+
 function writeText(res, statusCode, text, corsOrigin = '') {
     const buffer = Buffer.from(String(text ?? ''), 'utf8');
     res.statusCode = statusCode;
@@ -184,6 +193,66 @@ function readConfigFileText(configPath) {
         return fs.readFileSync(configPath, 'utf8');
     } catch {
         return '';
+    }
+}
+
+function cloneJsonSafe(value) {
+    if (value == null) return null;
+    try {
+        if (typeof globalThis.structuredClone === 'function') {
+            return globalThis.structuredClone(value);
+        }
+        return JSON.parse(JSON.stringify(value));
+    } catch {
+        return null;
+    }
+}
+
+function extractModelFromTargetRequest(targetUrl, jsonBody) {
+    const directModel = String(jsonBody?.model ?? '').trim();
+    if (directModel) return directModel;
+
+    const match = /\/models\/([^/:?]+)(?::[^/?]+)?/i.exec(String(targetUrl?.pathname ?? ''));
+    return match ? String(match[1] ?? '').trim() : '';
+}
+
+function buildStructuredSchemaPayload(jsonBody) {
+    if (!jsonBody || typeof jsonBody !== 'object') return null;
+    if (jsonBody.response_format?.json_schema) return cloneJsonSafe(jsonBody.response_format.json_schema);
+    if (jsonBody.text?.format) return cloneJsonSafe(jsonBody.text.format);
+    if (Array.isArray(jsonBody.tools) && jsonBody.tool_choice?.name === 'response') {
+        const tool = jsonBody.tools.find((entry) => entry && typeof entry === 'object' && entry.name === 'response');
+        if (tool) {
+            return {
+                name: tool.name,
+                input_schema: cloneJsonSafe(tool.input_schema),
+            };
+        }
+    }
+    if (jsonBody.generationConfig?.responseSchema) {
+        return cloneJsonSafe(jsonBody.generationConfig.responseSchema);
+    }
+    if (jsonBody.generationConfig?.responseJsonSchema) {
+        return cloneJsonSafe(jsonBody.generationConfig.responseJsonSchema);
+    }
+    return null;
+}
+
+function recordLastDebug(state, key, payload) {
+    if (!state || typeof state !== 'object') return;
+    if (!state.debugState || typeof state.debugState !== 'object') {
+        state.debugState = {};
+    }
+    state.debugState[key] = {
+        timestamp: new Date().toISOString(),
+        ...cloneJsonSafe(payload),
+    };
+}
+
+function logProxyEvent(logger, level, message) {
+    const method = level === 'warn' ? 'warn' : 'log';
+    if (typeof logger?.[method] === 'function') {
+        logger[method](message);
     }
 }
 
@@ -295,6 +364,7 @@ summary{cursor:pointer;font-size:12px;letter-spacing:.08em;text-transform:upperc
     <div class="meta">
       <div>Editing <code>config.yaml</code></div>
       <div>Host and port still need a restart.</div>
+      <div><a href="/__debug/last" target="_blank" rel="noreferrer">Last request debug</a></div>
     </div>
   </div>
 
@@ -886,7 +956,7 @@ async function handleProxyRequest(req, res, serverState) {
     const listenPort = serverState.listenPort;
     const listenHost = serverState.listenHost;
     const requestPath = String(req.url ?? '').split('?')[0];
-    const isConfigRoute = requestPath === '/' || requestPath === '' || requestPath === '/config.yaml' || requestPath === '/__config';
+    const isConfigRoute = requestPath === '/' || requestPath === '' || requestPath === '/config.yaml' || requestPath === '/__config' || requestPath === '/__debug/last';
     const corsOrigin = isConfigRoute ? '' : getAllowedCorsOrigin(req);
 
     if (req.method === 'OPTIONS') {
@@ -921,6 +991,14 @@ async function handleProxyRequest(req, res, serverState) {
         res.setHeader('Content-Type', 'text/yaml; charset=utf-8');
         res.setHeader('Content-Length', String(buffer.length));
         res.end(buffer);
+        return;
+    }
+
+    if (req.url === '/__debug/last' && req.method === 'GET') {
+        writePrettyJson(res, 200, {
+            prefill_generator: serverState.debugState?.lastPrefillGenerator ?? null,
+            structured_prefill: serverState.debugState?.lastStructuredPrefill ?? null,
+        }, '');
         return;
     }
 
@@ -1004,10 +1082,32 @@ async function handleProxyRequest(req, res, serverState) {
                 config: runtimeConfig.structuredPrefill.prefillGenerator,
                 skip: initialRewrite?.context?.continue?.active === true,
             });
+            if (pgProcessed.debug && pgProcessed.debug.sourceProvider) {
+                recordLastDebug(serverState, 'lastPrefillGenerator', {
+                    ...pgProcessed.debug,
+                    request_path: String(req.url ?? ''),
+                });
+                const debugTarget = String(pgProcessed.debug.generatorTargetUrl || pgProcessed.debug.sourceTargetUrl || '');
+                const debugModel = String(pgProcessed.debug.generatorModel || pgProcessed.debug.sourceModel || '');
+                const debugReason = String(pgProcessed.debug.reason || '');
+                const debugText = String(pgProcessed.debug.generatedText || '');
+                if (pgProcessed.debug.error) {
+                    logProxyEvent(
+                        serverState.logger,
+                        'warn',
+                        `[structured-prefill-proxy] prefill-generator provider=${pgProcessed.provider || pgProcessed.debug.sourceProvider} target=${debugTarget} model=${debugModel || '-'} status=${debugReason || 'error'} error=${pgProcessed.debug.error}`,
+                    );
+                } else {
+                    logProxyEvent(
+                        serverState.logger,
+                        'log',
+                        `[structured-prefill-proxy] prefill-generator provider=${pgProcessed.provider || pgProcessed.debug.sourceProvider} target=${debugTarget} model=${debugModel || '-'} status=${debugReason || 'ok'} generated_chars=${debugText.length}`,
+                    );
+                }
+            }
             const effectiveParsed = pgProcessed.applied ? pgProcessed.jsonBody : parsed;
-            if (pgProcessed.applied) {
+            if (pgProcessed.applied && pgProcessed.debug?.attempted) {
                 requestBodyBuffer = Buffer.from(JSON.stringify(effectiveParsed));
-                console.log(`[structured-prefill-proxy] prefill-generator provider=${pgProcessed.provider} target=${targetUrl.origin}${targetUrl.pathname}`);
             }
 
             const rewritten = pgProcessed.applied ? rewriteProxyJsonRequest({
@@ -1023,7 +1123,28 @@ async function handleProxyRequest(req, res, serverState) {
                     clientRequestedStream,
                 };
                 requestBodyBuffer = Buffer.from(JSON.stringify(rewritten.jsonBody));
-                console.log(`[structured-prefill-proxy] activated provider=${requestContext.provider} target=${upstreamTargetUrl.origin}${upstreamTargetUrl.pathname}`);
+                recordLastDebug(serverState, 'lastStructuredPrefill', {
+                    request_path: String(req.url ?? ''),
+                    provider: requestContext.provider,
+                    target: upstreamTargetUrl.toString(),
+                    model: extractModelFromTargetRequest(upstreamTargetUrl, rewritten.jsonBody),
+                    pattern_mode: requestContext.patternMode,
+                    prefill_template: requestContext.prefillTemplate,
+                    hide_prefill_in_display: Boolean(requestContext.hidePrefillInDisplay),
+                    continue: cloneJsonSafe(requestContext.continue),
+                    response_schema: cloneJsonSafe(requestContext.responseSchema),
+                    provider_schema_payload: buildStructuredSchemaPayload(rewritten.jsonBody),
+                    request_body: cloneJsonSafe(rewritten.jsonBody),
+                });
+                logProxyEvent(
+                    serverState.logger,
+                    'log',
+                    `[structured-prefill-proxy] activated provider=${requestContext.provider} target=${upstreamTargetUrl.origin}${upstreamTargetUrl.pathname} model=${extractModelFromTargetRequest(upstreamTargetUrl, rewritten.jsonBody) || '-'}`,
+                );
+                const pattern = String(requestContext?.responseSchema?.properties?.response?.pattern ?? '');
+                if (pattern) {
+                    logProxyEvent(serverState.logger, 'log', `[structured-prefill-proxy] regex=${pattern}`);
+                }
             }
         } catch {
             rewrittenContentType = '';
@@ -1143,11 +1264,15 @@ function startServer({ proxyDir = path.resolve(__dirname, '..'), logger = consol
         listenPort,
         listenHost,
         logger,
+        debugState: {
+            lastPrefillGenerator: null,
+            lastStructuredPrefill: null,
+        },
     };
 
     const server = http.createServer((req, res) => {
         const requestPath = String(req?.url ?? '').split('?')[0];
-        const isConfigRoute = requestPath === '/' || requestPath === '' || requestPath === '/config.yaml' || requestPath === '/__config';
+        const isConfigRoute = requestPath === '/' || requestPath === '' || requestPath === '/config.yaml' || requestPath === '/__config' || requestPath === '/__debug/last';
         const corsOrigin = isConfigRoute ? '' : getAllowedCorsOrigin(req);
         handleProxyRequest(req, res, serverState).catch((error) => {
             writeJson(res, 500, {
