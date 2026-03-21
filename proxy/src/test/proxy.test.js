@@ -434,6 +434,104 @@ test('openai chat stream chunks are incrementally unwrapped into visible deltas'
     assert.equal(second.choices[0].delta.content, 'lo');
 });
 
+test('openai chat stream chunks keep hidden prefills out of visible deltas', () => {
+    const targetUrl = new URL('https://api.openai.com/v1/chat/completions');
+    const body = {
+        model: 'gpt-4.1',
+        stream: true,
+        messages: [
+            { role: 'user', content: 'Continue.' },
+            { role: 'assistant', content: 'ZXQHIDE:' },
+        ],
+    };
+
+    const rewritten = rewriteProxyJsonRequest({
+        targetUrl,
+        jsonBody: body,
+        baseConfig: {
+            enabled: true,
+            minCharsAfterPrefix: 8,
+            newlineToken: '\\n',
+            hidePrefillInDisplay: true,
+        },
+    });
+
+    const streamState = {
+        rawByChoice: new Map(),
+        visibleByChoice: new Map(),
+    };
+
+    const first = transformOpenAiChatStreamChunk({
+        id: 'chatcmpl-test',
+        object: 'chat.completion.chunk',
+        created: 1,
+        model: 'gpt-test',
+        choices: [
+            {
+                index: 0,
+                delta: {
+                    role: 'assistant',
+                    content: '{"response":"ZX',
+                },
+                finish_reason: null,
+            },
+        ],
+    }, rewritten.context, streamState);
+
+    const second = transformOpenAiChatStreamChunk({
+        id: 'chatcmpl-test',
+        object: 'chat.completion.chunk',
+        created: 1,
+        model: 'gpt-test',
+        choices: [
+            {
+                index: 0,
+                delta: {
+                    content: 'Q',
+                },
+                finish_reason: null,
+            },
+        ],
+    }, rewritten.context, streamState);
+
+    const third = transformOpenAiChatStreamChunk({
+        id: 'chatcmpl-test',
+        object: 'chat.completion.chunk',
+        created: 1,
+        model: 'gpt-test',
+        choices: [
+            {
+                index: 0,
+                delta: {
+                    content: 'HIDE:',
+                },
+                finish_reason: null,
+            },
+        ],
+    }, rewritten.context, streamState);
+
+    const fourth = transformOpenAiChatStreamChunk({
+        id: 'chatcmpl-test',
+        object: 'chat.completion.chunk',
+        created: 1,
+        model: 'gpt-test',
+        choices: [
+            {
+                index: 0,
+                delta: {
+                    content: ' hello"}',
+                },
+                finish_reason: null,
+            },
+        ],
+    }, rewritten.context, streamState);
+
+    assert.equal(first, null);
+    assert.equal(second, null);
+    assert.equal(third, null);
+    assert.equal(fourth.choices[0].delta.content, ' hello');
+});
+
 test('sse error payloads are extracted for visible passthrough', () => {
     const extracted = extractJsonPayloadFromSseText([
         'event: message',
@@ -1026,14 +1124,6 @@ structured_prefill:
     assert.equal(store.config.routing.openRouterBaseUrl, 'https://openrouter.ai/api/');
     assert.equal(store.config.structuredPrefill.hidePrefillInDisplay, true);
 
-    const waitUntilNextTimestamp = () => {
-        const start = Date.now();
-        while (Date.now() === start) {
-            // busy wait long enough to guarantee a new mtime on Windows
-        }
-    };
-
-    waitUntilNextTimestamp();
     fs.writeFileSync(configPath, `
 server:
   host: "127.0.0.1"
@@ -1046,6 +1136,8 @@ structured_prefill:
   continue:
     mode: "force"
 `, 'utf8');
+    const bumpedTime = new Date(Date.now() + 2000);
+    fs.utimesSync(configPath, bumpedTime, bumpedTime);
 
     const logs = [];
     refreshLiveConfigStore(store, {

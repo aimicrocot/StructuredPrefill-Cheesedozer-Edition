@@ -9,6 +9,7 @@ const crypto = require('node:crypto');
 const {
     DEFAULT_PROXY_CONFIG,
     createUsageText,
+    finalizeVisibleStructuredText,
     rewriteProxyJsonRequest,
     rewriteProxyJsonResponse,
     tryUnwrapStructuredOutput,
@@ -717,7 +718,14 @@ function normalizeUpstreamError(upstreamResponse, upstreamText, upstreamContentT
 function getStructuredStreamVisibleText(rawText, context, previousVisible = '') {
     const raw = String(rawText ?? '');
     const visible = tryUnwrapStructuredOutput(raw, context);
-    if (typeof visible === 'string') return visible;
+    if (typeof visible === 'string') {
+        const normalizedVisible = String(visible ?? '');
+        const hideLiteral = String(context?.hideState?.literal ?? '');
+        if (hideLiteral && normalizedVisible && normalizedVisible.length <= hideLiteral.length && hideLiteral.startsWith(normalizedVisible)) {
+            return String(previousVisible ?? '');
+        }
+        return finalizeVisibleStructuredText(normalizedVisible, context);
+    }
     if (raw.trimStart().startsWith('{')) return String(previousVisible ?? '');
     return String(previousVisible ?? '');
 }

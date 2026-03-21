@@ -632,6 +632,13 @@ function trimMalformedTrailingGarbage(text, context) {
     return normalized;
 }
 
+function finalizeVisibleStructuredText(text, context) {
+    const normalized = normalizeNewlines(String(text ?? ''));
+    if (!normalized) return normalized;
+    const trimmed = trimMalformedTrailingGarbage(normalized, context);
+    return applyDisplayHiding(applyContinueJoin(trimmed, context), context);
+}
+
 function canonicalizeForContinueMatch(text) {
     const input = normalizeNewlines(String(text ?? ''));
     let out = '';
@@ -1056,14 +1063,12 @@ function tryUnwrapStructuredOutput(text, context) {
 function unwrapStructuredResult(value, context) {
     if (typeof value === 'string') {
         const unwrapped = tryUnwrapStructuredOutput(value, context) ?? decodeStructuredText(value, context);
-        const trimmed = trimMalformedTrailingGarbage(unwrapped, context);
-        return applyDisplayHiding(applyContinueJoin(trimmed, context), context);
+        return finalizeVisibleStructuredText(unwrapped, context);
     }
     if (value && typeof value === 'object') {
         const unwrapped = tryUnwrapStructuredObject(value, context);
         if (unwrapped == null) return null;
-        const trimmed = trimMalformedTrailingGarbage(unwrapped, context);
-        return applyDisplayHiding(applyContinueJoin(trimmed, context), context);
+        return finalizeVisibleStructuredText(unwrapped, context);
     }
     return null;
 }
@@ -1884,6 +1889,7 @@ module.exports = {
     rewriteProxyJsonRequest,
     rewriteProxyJsonResponse,
     splitEndPrefillTemplate,
+    finalizeVisibleStructuredText,
     tryUnwrapStructuredOutput,
     unwrapStructuredResult,
 };
