@@ -1,0 +1,44 @@
+# StructuredPrefill proxy config
+#
+# Easy bases:
+#   OpenRouter: http://localhost:8382/openrouter
+#   OpenAI:     http://localhost:8382/openai
+#   Anthropic:  http://localhost:8382/anthropic
+#   Gemini:     http://localhost:8382/google
+
+server:
+  host: "127.0.0.1"
+  port: 8382
+
+routing:
+  allow_full_url_targets: true
+  openai_base_url: "https://api.openai.com"
+  openrouter_base_url: "https://openrouter.ai/api"
+  openai_compatible_base_url: "https://api.openai.com"
+  anthropic_base_url: "https://api.anthropic.com"
+  google_base_url: "https://generativelanguage.googleapis.com"
+
+structured_prefill:
+  enabled: true
+  min_chars_after_prefix: 80
+  newline_token: '\n'
+  hide_prefill_in_display: true
+  anti_slop_ban_list: ""
+  continue:
+    mode: "off"
+    overlap_chars: 14
+  prefill_generator:
+    enabled: false
+    provider: "auto"
+    target_url: ""
+    api_key: ""
+    api_key_header: ""
+    api_key_prefix: ""
+    extra_headers: ""
+    model: ""
+    max_tokens: 15
+    timeout_ms: 120000
+    stop: ""
+    keep_matched_stop_string: false
+    extra_prompt: ""
+    extra_prompt_role: "system"

@@ -1,5 +1,8 @@
 https://rentry.org/structuredprefill
 
+## Standalone proxy
+If you want a simple standalone proxy version instead of the SillyTavern extension path, see [`proxy/README.md`](./proxy/README.md).
+
 ## TLDR?
 1) install the extension  
 2) add an **assistant-role** message at the very bottom (your prefill)  

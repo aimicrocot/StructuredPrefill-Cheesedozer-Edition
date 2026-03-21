@@ -1,0 +1,14 @@
+{
+  "name": "structured-prefill-proxy",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Minimal standalone StructuredPrefill HTTP proxy.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test src/test/proxy.test.js"
+  },
+  "engines": {
+    "node": ">=18.17"
+  }
+}
