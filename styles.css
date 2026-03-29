@@ -74,3 +74,15 @@
     margin-left: 1px;
     margin-right: 1px;
 }
+
+.structuredprefill-preset-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-bottom: 6px;
+}
+
+.structuredprefill-preset-row > select {
+    flex: 1 1 auto;
+    min-width: 0;
+}

@@ -1,14 +1,14 @@
 import { chat, getRequestHeaders, messageFormatting, saveSettingsDebounced, scrollChatToBottom, updateMessageBlock } from '../../../../script.js';
 import { extension_settings } from '../../../extensions.js';
 import { getRegexedString, regex_placement } from '../../regex/engine.js';
+import { download, getFileText } from '../../../utils.js';
 
-const { eventSource, event_types, renderExtensionTemplateAsync } = SillyTavern.getContext();
+const { eventSource, event_types, renderExtensionTemplateAsync, callPopup } = SillyTavern.getContext();
 
 const extensionName = 'StructuredPrefill';
 const extensionPath = 'third-party/StructuredPrefill';
 
-const defaultSettings = {
-    enabled: true,
+const defaultPresetSettings = {
     hide_prefill_in_display: true,
     newline_token: '\\n',
     // Require some actual continuation beyond the prefix (in chars).
@@ -28,6 +28,20 @@ const defaultSettings = {
     prefill_gen_stop: '',
     prefill_gen_keep_matched_stop_string: false,
     prefill_gen_timeout_ms: 120000,
+
+    // Optional prefill injected/replaced by this extension before json_schema processing.
+    override_prefill_enabled: false,
+    override_prefill_text: '',
+};
+
+const presetSettingKeys = Object.keys(defaultPresetSettings);
+
+const defaultSettings = {
+    enabled: true,
+    active_preset: 'Default',
+    active_preset_idx: 0,
+    presets: [{ name: 'Default', ...defaultPresetSettings }],
+    ...defaultPresetSettings,
 };
 
 const runtimeState = {
@@ -202,19 +216,215 @@ function schedulePostFrameGuard(messageId) {
     });
 }
 
+function getDefaultPreset(name = 'Default') {
+    return {
+        name: String(name ?? 'Default').trim() || 'Default',
+        ...defaultPresetSettings,
+    };
+}
+
+function normalizePresetObject(rawPreset, fallbackName = 'Default') {
+    const preset = getDefaultPreset(rawPreset?.name ?? fallbackName);
+
+    preset.hide_prefill_in_display = rawPreset?.hide_prefill_in_display == null
+        ? defaultPresetSettings.hide_prefill_in_display
+        : !!rawPreset.hide_prefill_in_display;
+    preset.newline_token = String(rawPreset?.newline_token ?? defaultPresetSettings.newline_token);
+    preset.min_chars_after_prefix = clampInt(rawPreset?.min_chars_after_prefix, 1, 10000, defaultPresetSettings.min_chars_after_prefix);
+    preset.continue_overlap_chars = clampInt(rawPreset?.continue_overlap_chars, 0, 120, defaultPresetSettings.continue_overlap_chars);
+    preset.anti_slop_ban_list = String(rawPreset?.anti_slop_ban_list ?? defaultPresetSettings.anti_slop_ban_list);
+
+    preset.prefill_gen_enabled = !!rawPreset?.prefill_gen_enabled;
+    preset.prefill_gen_extra_prompt = String(rawPreset?.prefill_gen_extra_prompt ?? defaultPresetSettings.prefill_gen_extra_prompt);
+    preset.prefill_gen_extra_prompt_role = normalizePrefillGenExtraPromptRole(rawPreset?.prefill_gen_extra_prompt_role);
+    preset.prefill_gen_profile_id = String(rawPreset?.prefill_gen_profile_id ?? defaultPresetSettings.prefill_gen_profile_id);
+    preset.prefill_gen_max_tokens = clampInt(rawPreset?.prefill_gen_max_tokens, 1, 20000048, defaultPresetSettings.prefill_gen_max_tokens);
+    preset.prefill_gen_stop = String(rawPreset?.prefill_gen_stop ?? defaultPresetSettings.prefill_gen_stop);
+    preset.prefill_gen_keep_matched_stop_string = !!rawPreset?.prefill_gen_keep_matched_stop_string;
+    preset.prefill_gen_timeout_ms = clampInt(rawPreset?.prefill_gen_timeout_ms, 500, 120000, defaultPresetSettings.prefill_gen_timeout_ms);
+
+    preset.override_prefill_enabled = !!rawPreset?.override_prefill_enabled;
+    preset.override_prefill_text = String(rawPreset?.override_prefill_text ?? defaultPresetSettings.override_prefill_text);
+
+    return preset;
+}
+
+function buildPresetFromCurrentRuntime(settings, name = 'Default') {
+    const preset = getDefaultPreset(name);
+    for (const key of presetSettingKeys) {
+        preset[key] = settings?.[key] ?? defaultPresetSettings[key];
+    }
+    return normalizePresetObject(preset, name);
+}
+
+function uniquifyPresetName(name, usedNames) {
+    const base = String(name ?? '').trim() || 'Preset';
+    if (!usedNames.has(base)) {
+        usedNames.add(base);
+        return base;
+    }
+
+    let counter = 1;
+    let next = `${base} ${counter}`;
+    while (usedNames.has(next)) {
+        counter++;
+        next = `${base} ${counter}`;
+    }
+
+    usedNames.add(next);
+    return next;
+}
+
+function getActivePreset(settings = extension_settings[extensionName]) {
+    if (!settings || !Array.isArray(settings.presets) || settings.presets.length === 0) return null;
+    const idx = clampInt(settings.active_preset_idx, 0, settings.presets.length - 1, 0);
+    return settings.presets[idx] ?? null;
+}
+
+function applyPresetToRuntimeSettings(preset, { save = false } = {}) {
+    const settings = extension_settings[extensionName];
+    if (!settings || !preset) return;
+
+    for (const key of presetSettingKeys) {
+        settings[key] = preset[key] ?? defaultPresetSettings[key];
+    }
+
+    if (save) {
+        saveSettingsDebounced();
+    }
+}
+
+function syncRuntimeSettingsToActivePreset() {
+    const settings = extension_settings[extensionName];
+    const preset = getActivePreset(settings);
+    if (!settings || !preset) return;
+
+    for (const key of presetSettingKeys) {
+        preset[key] = settings[key] ?? defaultPresetSettings[key];
+    }
+}
+
+function updateOrInsertPreset(presets, preset) {
+    const index = presets.findIndex(item => item.name === preset.name);
+    if (index !== -1) {
+        presets[index] = preset;
+        return index;
+    }
+
+    presets.push(preset);
+    return presets.length - 1;
+}
+
+function refreshPresetList() {
+    const settings = extension_settings[extensionName];
+    const $presetList = $('#structuredprefill_preset_list').empty();
+    for (const preset of settings.presets) {
+        $presetList.append($('<option>', { value: preset.name, text: preset.name }));
+    }
+    $presetList.val(settings.active_preset);
+}
+
+function setPresetSetting(key, value, { rerender = false } = {}) {
+    const settings = extension_settings[extensionName];
+    settings[key] = value;
+    syncRuntimeSettingsToActivePreset();
+    if (rerender) {
+        renderSettingsToUi();
+    }
+    saveSettingsDebounced();
+}
+
+function changePreset(idx) {
+    const settings = extension_settings[extensionName];
+    if (!Array.isArray(settings.presets) || !settings.presets.length) return;
+
+    const nextIdx = clampInt(idx, 0, settings.presets.length - 1, 0);
+    settings.active_preset_idx = nextIdx;
+    settings.active_preset = settings.presets[nextIdx].name;
+    applyPresetToRuntimeSettings(settings.presets[nextIdx]);
+    renderSettingsToUi();
+    saveSettingsDebounced();
+}
+
+async function importPreset(file) {
+    if (!file) {
+        toastr.error('No file provided.');
+        return;
+    }
+
+    try {
+        const fileText = await getFileText(file);
+        const rawPreset = JSON.parse(fileText);
+        const preset = normalizePresetObject(rawPreset, 'Imported Preset');
+        if (!preset.name) {
+            throw new Error('Missing preset name');
+        }
+
+        const settings = extension_settings[extensionName];
+        const presetIdx = updateOrInsertPreset(settings.presets, preset);
+        changePreset(presetIdx);
+        toastr.success(`StructuredPrefill preset "${preset.name}" imported.`);
+    } catch (error) {
+        console.error(error);
+        toastr.error('Invalid StructuredPrefill preset JSON.');
+    }
+}
+
+async function promptForPresetName({ title, initialValue = '' }) {
+    const popupHtml = $(await renderExtensionTemplateAsync(extensionPath, 'preset_name_popup'));
+    popupHtml.find('.structuredprefill-preset-popup-title').text(title);
+    popupHtml.find('.structuredprefill-preset-name').val(String(initialValue ?? ''));
+
+    const confirmed = await callPopup(popupHtml, 'confirm', undefined, { okButton: 'Save' });
+    if (!confirmed) {
+        return '';
+    }
+
+    return String(popupHtml.find('.structuredprefill-preset-name').val() ?? '').trim();
+}
+
 function loadSettings() {
     extension_settings[extensionName] ??= {};
+    const settings = extension_settings[extensionName];
+
     if (
-        extension_settings[extensionName].prefill_gen_keep_matched_stop_string == null &&
-        extension_settings[extensionName].prefill_gen_include_profile_stop_strings != null
+        settings.prefill_gen_keep_matched_stop_string == null &&
+        settings.prefill_gen_include_profile_stop_strings != null
     ) {
-        extension_settings[extensionName].prefill_gen_keep_matched_stop_string = !!extension_settings[extensionName].prefill_gen_include_profile_stop_strings;
+        settings.prefill_gen_keep_matched_stop_string = !!settings.prefill_gen_include_profile_stop_strings;
     }
-    for (const [key, value] of Object.entries(defaultSettings)) {
-        extension_settings[extensionName][key] ??= value;
+
+    settings.enabled ??= defaultSettings.enabled;
+    settings.active_preset = String(settings.active_preset ?? defaultSettings.active_preset);
+    settings.active_preset_idx = Number.isInteger(settings.active_preset_idx) ? settings.active_preset_idx : defaultSettings.active_preset_idx;
+
+    for (const key of presetSettingKeys) {
+        settings[key] ??= defaultPresetSettings[key];
     }
-    if (clampInt(extension_settings[extensionName].prefill_gen_timeout_ms, 500, 120000, 120000) === 12000) {
-        extension_settings[extensionName].prefill_gen_timeout_ms = 120000;
+
+    if (!Array.isArray(settings.presets) || settings.presets.length === 0) {
+        settings.presets = [buildPresetFromCurrentRuntime(settings, settings.active_preset || 'Default')];
+    } else {
+        settings.presets = settings.presets.map((preset, index) => normalizePresetObject(preset, index === 0 ? 'Default' : `Preset ${index + 1}`));
+    }
+
+    const usedNames = new Set();
+    for (const preset of settings.presets) {
+        preset.name = uniquifyPresetName(preset.name, usedNames);
+    }
+
+    let activeIdx = settings.presets.findIndex(preset => preset.name === settings.active_preset);
+    if (activeIdx === -1) {
+        activeIdx = clampInt(settings.active_preset_idx, 0, settings.presets.length - 1, 0);
+    }
+
+    settings.active_preset_idx = activeIdx;
+    settings.active_preset = settings.presets[activeIdx]?.name ?? 'Default';
+    applyPresetToRuntimeSettings(settings.presets[activeIdx]);
+
+    if (clampInt(settings.prefill_gen_timeout_ms, 500, 120000, 120000) === 12000) {
+        settings.prefill_gen_timeout_ms = 120000;
+        syncRuntimeSettingsToActivePreset();
     }
 }
 
@@ -552,6 +762,13 @@ function supportsStructuredPrefillForSource(chatCompletionSource) {
 
 function normalizeNewlines(text) {
     return String(text ?? '').replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+}
+
+function getOverridePrefillText(settings = extension_settings[extensionName]) {
+    if (!settings?.override_prefill_enabled) return '';
+
+    const text = normalizeNewlines(settings.override_prefill_text ?? '');
+    return text.length > 0 ? text : '';
 }
 
 function prefixHasSlots(prefix) {
@@ -2486,11 +2703,24 @@ async function onChatCompletionSettingsReady(generateData) {
     // OpenRouter is OpenAI-compatible. Some routed providers/models may ignore or partially enforce `json_schema`.
     // We still attempt injection for any OpenRouter model and let it be a no-op if the backend doesn't enforce it.
 
-    // We only activate when the chat "tail" is an assistant message (prefill-like).
+    const overridePrefillText = getOverridePrefillText(settings);
+
+    // We usually activate when the chat "tail" is an assistant message (prefill-like).
     // For Continue, ST commonly appends a trailing system instruction, so we look at the last *non-system* message.
+    // If this preset defines an override prefill, we can synthesize/replace that tail for normal generations.
     let tailIndex = messages.length - 1;
     while (tailIndex >= 0 && messages[tailIndex]?.role === 'system') tailIndex--;
-    const tail = tailIndex >= 0 ? messages[tailIndex] : null;
+    let tail = tailIndex >= 0 ? messages[tailIndex] : null;
+
+    if (!isContinue && overridePrefillText) {
+        if (tail?.role === 'assistant') {
+            tail.content = overridePrefillText;
+        } else {
+            tail = { role: 'assistant', content: overridePrefillText };
+            messages.push(tail);
+            tailIndex = messages.length - 1;
+        }
+    }
 
     if (!tail || tail.role !== 'assistant' || typeof tail.content !== 'string') return;
     let tailContent = tail.content;
@@ -2575,6 +2805,10 @@ async function onChatCompletionSettingsReady(generateData) {
                 // Tail doesn't look like the base message; treat the whole tail as a PM prefill template.
                 pmPrefix = prefillTemplate;
             }
+        }
+
+        if (overridePrefillText) {
+            pmPrefix = overridePrefillText;
         }
 
         if (baseText) {
@@ -2822,8 +3056,11 @@ function onGenerationStopped() {
 
 function renderSettingsToUi() {
     const settings = extension_settings[extensionName];
+    refreshPresetList();
     $('#structuredprefill_enabled').prop('checked', !!settings.enabled);
     $('#structuredprefill_hide_prefill_in_display').prop('checked', !!settings.hide_prefill_in_display);
+    $('#structuredprefill_override_prefill_enabled').prop('checked', !!settings.override_prefill_enabled);
+    $('#structuredprefill_override_prefill_text').val(String(settings.override_prefill_text ?? ''));
     $('#structuredprefill_min_chars_after_prefix').val(String(settings.min_chars_after_prefix ?? 80));
     $('#structuredprefill_prefill_gen_enabled').prop('checked', !!settings.prefill_gen_enabled);
     $('#structuredprefill_prefill_gen_extra_prompt').val(String(settings.prefill_gen_extra_prompt ?? ''));
@@ -2839,6 +3076,85 @@ function renderSettingsToUi() {
 }
 
 function setupUiListeners() {
+    $('#structuredprefill_preset_list')
+        .off('change')
+        .on('change', () => {
+            changePreset($('#structuredprefill_preset_list').prop('selectedIndex'));
+        });
+
+    $('#structuredprefill_preset_new')
+        .off('click')
+        .on('click', async () => {
+            const settings = extension_settings[extensionName];
+            const currentPreset = getActivePreset(settings) ?? getDefaultPreset();
+            const requestedName = await promptForPresetName({ title: 'New StructuredPrefill preset', initialValue: '' });
+            if (!requestedName) return;
+
+            const usedNames = new Set(settings.presets.map(preset => preset.name));
+            const presetName = uniquifyPresetName(requestedName, usedNames);
+            const preset = normalizePresetObject({ ...currentPreset, name: presetName }, presetName);
+            const presetIdx = updateOrInsertPreset(settings.presets, preset);
+            changePreset(presetIdx);
+        });
+
+    $('#structuredprefill_preset_rename')
+        .off('click')
+        .on('click', async () => {
+            const settings = extension_settings[extensionName];
+            const activePreset = getActivePreset(settings);
+            if (!activePreset) return;
+
+            const requestedName = await promptForPresetName({ title: 'Rename StructuredPrefill preset', initialValue: activePreset.name });
+            if (!requestedName) return;
+
+            const usedNames = new Set(settings.presets.filter((_, index) => index !== settings.active_preset_idx).map(preset => preset.name));
+            activePreset.name = uniquifyPresetName(requestedName, usedNames);
+            settings.active_preset = activePreset.name;
+            refreshPresetList();
+            $('#structuredprefill_preset_list').val(activePreset.name);
+            saveSettingsDebounced();
+        });
+
+    $('#structuredprefill_preset_import_file')
+        .off('change')
+        .on('change', async function () {
+            for (const file of this.files) {
+                await importPreset(file);
+            }
+            this.value = '';
+        });
+
+    $('#structuredprefill_preset_import')
+        .off('click')
+        .on('click', () => {
+            $('#structuredprefill_preset_import_file').trigger('click');
+        });
+
+    $('#structuredprefill_preset_export')
+        .off('click')
+        .on('click', () => {
+            const activePreset = getActivePreset();
+            if (!activePreset) return;
+
+            const fileName = `${activePreset.name.replace(/[\s.<>:"/\\|?*\x00-\x1F\x7F]/g, '_').toLowerCase()}.json`;
+            download(JSON.stringify(activePreset, null, 4), fileName, 'application/json');
+        });
+
+    $('#structuredprefill_preset_delete')
+        .off('click')
+        .on('click', async () => {
+            const settings = extension_settings[extensionName];
+            const confirmed = await callPopup('Are you sure you want to delete this StructuredPrefill preset?', 'confirm');
+            if (!confirmed) return;
+
+            settings.presets.splice(settings.active_preset_idx, 1);
+            if (settings.presets.length === 0) {
+                settings.presets.push(getDefaultPreset());
+            }
+
+            changePreset(Math.min(settings.active_preset_idx, settings.presets.length - 1));
+        });
+
     $('#structuredprefill_enabled')
         .off('click')
         .on('click', () => {
@@ -2849,97 +3165,101 @@ function setupUiListeners() {
     $('#structuredprefill_hide_prefill_in_display')
         .off('click')
         .on('click', () => {
-            extension_settings[extensionName].hide_prefill_in_display = !!$('#structuredprefill_hide_prefill_in_display').prop('checked');
-            saveSettingsDebounced();
+            setPresetSetting('hide_prefill_in_display', !!$('#structuredprefill_hide_prefill_in_display').prop('checked'));
+        });
+
+    $('#structuredprefill_override_prefill_enabled')
+        .off('click')
+        .on('click', () => {
+            setPresetSetting('override_prefill_enabled', !!$('#structuredprefill_override_prefill_enabled').prop('checked'));
+        });
+
+    $('#structuredprefill_override_prefill_text')
+        .off('input')
+        .on('input', () => {
+            setPresetSetting('override_prefill_text', String($('#structuredprefill_override_prefill_text').val() ?? ''));
         });
 
     $('#structuredprefill_min_chars_after_prefix')
         .off('change')
         .on('change', () => {
-            extension_settings[extensionName].min_chars_after_prefix = clampInt($('#structuredprefill_min_chars_after_prefix').val(), 1, 10000, 80);
-            $('#structuredprefill_min_chars_after_prefix').val(String(extension_settings[extensionName].min_chars_after_prefix));
-            saveSettingsDebounced();
+            const value = clampInt($('#structuredprefill_min_chars_after_prefix').val(), 1, 10000, 80);
+            setPresetSetting('min_chars_after_prefix', value);
+            $('#structuredprefill_min_chars_after_prefix').val(String(value));
         });
 
     $('#structuredprefill_prefill_gen_enabled')
         .off('click')
         .on('click', () => {
-            extension_settings[extensionName].prefill_gen_enabled = !!$('#structuredprefill_prefill_gen_enabled').prop('checked');
-            saveSettingsDebounced();
+            setPresetSetting('prefill_gen_enabled', !!$('#structuredprefill_prefill_gen_enabled').prop('checked'));
         });
 
     $('#structuredprefill_prefill_gen_extra_prompt')
         .off('input')
         .on('input', () => {
-            extension_settings[extensionName].prefill_gen_extra_prompt = String($('#structuredprefill_prefill_gen_extra_prompt').val() ?? '');
-            saveSettingsDebounced();
+            setPresetSetting('prefill_gen_extra_prompt', String($('#structuredprefill_prefill_gen_extra_prompt').val() ?? ''));
         });
 
     $('#structuredprefill_prefill_gen_extra_prompt_role')
         .off('change')
         .on('change', () => {
-            extension_settings[extensionName].prefill_gen_extra_prompt_role = normalizePrefillGenExtraPromptRole($('#structuredprefill_prefill_gen_extra_prompt_role').val());
-            $('#structuredprefill_prefill_gen_extra_prompt_role').val(extension_settings[extensionName].prefill_gen_extra_prompt_role);
-            saveSettingsDebounced();
+            const value = normalizePrefillGenExtraPromptRole($('#structuredprefill_prefill_gen_extra_prompt_role').val());
+            setPresetSetting('prefill_gen_extra_prompt_role', value);
+            $('#structuredprefill_prefill_gen_extra_prompt_role').val(value);
         });
 
     $('#structuredprefill_prefill_gen_profile')
         .off('change')
         .on('change', () => {
-            extension_settings[extensionName].prefill_gen_profile_id = String($('#structuredprefill_prefill_gen_profile').val() ?? '');
-            saveSettingsDebounced();
+            setPresetSetting('prefill_gen_profile_id', String($('#structuredprefill_prefill_gen_profile').val() ?? ''));
         });
 
     $('#structuredprefill_prefill_gen_max_tokens')
         .off('change')
         .on('change', () => {
-            extension_settings[extensionName].prefill_gen_max_tokens = clampInt($('#structuredprefill_prefill_gen_max_tokens').val(), 1, 20000048, 15);
-            $('#structuredprefill_prefill_gen_max_tokens').val(String(extension_settings[extensionName].prefill_gen_max_tokens));
-            saveSettingsDebounced();
+            const value = clampInt($('#structuredprefill_prefill_gen_max_tokens').val(), 1, 20000048, 15);
+            setPresetSetting('prefill_gen_max_tokens', value);
+            $('#structuredprefill_prefill_gen_max_tokens').val(String(value));
         });
 
     $('#structuredprefill_prefill_gen_stop')
         .off('input')
         .on('input', () => {
-            extension_settings[extensionName].prefill_gen_stop = String($('#structuredprefill_prefill_gen_stop').val() ?? '');
-            saveSettingsDebounced();
+            setPresetSetting('prefill_gen_stop', String($('#structuredprefill_prefill_gen_stop').val() ?? ''));
         });
 
     $('#structuredprefill_prefill_gen_keep_matched_stop_string')
         .off('click')
         .on('click', () => {
-            extension_settings[extensionName].prefill_gen_keep_matched_stop_string = !!$('#structuredprefill_prefill_gen_keep_matched_stop_string').prop('checked');
-            saveSettingsDebounced();
+            setPresetSetting('prefill_gen_keep_matched_stop_string', !!$('#structuredprefill_prefill_gen_keep_matched_stop_string').prop('checked'));
         });
 
     $('#structuredprefill_prefill_gen_timeout_ms')
         .off('change')
         .on('change', () => {
-            extension_settings[extensionName].prefill_gen_timeout_ms = clampInt($('#structuredprefill_prefill_gen_timeout_ms').val(), 500, 120000, 120000);
-            $('#structuredprefill_prefill_gen_timeout_ms').val(String(extension_settings[extensionName].prefill_gen_timeout_ms));
-            saveSettingsDebounced();
+            const value = clampInt($('#structuredprefill_prefill_gen_timeout_ms').val(), 500, 120000, 120000);
+            setPresetSetting('prefill_gen_timeout_ms', value);
+            $('#structuredprefill_prefill_gen_timeout_ms').val(String(value));
         });
 
     $('#structuredprefill_newline_token')
         .off('input')
         .on('input', () => {
-            extension_settings[extensionName].newline_token = String($('#structuredprefill_newline_token').val() ?? '<NL>');
-            saveSettingsDebounced();
+            setPresetSetting('newline_token', String($('#structuredprefill_newline_token').val() ?? '<NL>'));
         });
 
     $('#structuredprefill_continue_overlap_chars')
         .off('change')
         .on('change', () => {
-            extension_settings[extensionName].continue_overlap_chars = clampInt($('#structuredprefill_continue_overlap_chars').val(), 0, 120, 14);
-            $('#structuredprefill_continue_overlap_chars').val(String(extension_settings[extensionName].continue_overlap_chars));
-            saveSettingsDebounced();
+            const value = clampInt($('#structuredprefill_continue_overlap_chars').val(), 0, 120, 14);
+            setPresetSetting('continue_overlap_chars', value);
+            $('#structuredprefill_continue_overlap_chars').val(String(value));
         });
 
     $('#structuredprefill_anti_slop_ban_list')
         .off('input')
         .on('input', () => {
-            extension_settings[extensionName].anti_slop_ban_list = String($('#structuredprefill_anti_slop_ban_list').val() ?? '');
-            saveSettingsDebounced();
+            setPresetSetting('anti_slop_ban_list', String($('#structuredprefill_anti_slop_ban_list').val() ?? ''));
         });
 }
 

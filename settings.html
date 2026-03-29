@@ -8,6 +8,26 @@
         <div class="inline-drawer-content">
             <div class="structuredprefill-settings-group inline-drawer">
                 <div class="inline-drawer-toggle inline-drawer-header structuredprefill-section-toggle">
+                    <span class="structuredprefill-section-label">Presets</span>
+                    <div class="inline-drawer-icon fa-solid fa-circle-chevron-up up"></div>
+                </div>
+
+                <div class="inline-drawer-content structuredprefill-section-content" style="display:block;">
+                    <div class="structuredprefill-preset-row">
+                        <select id="structuredprefill_preset_list" class="text_pole"></select>
+                        <div class="menu_button menu_button_icon fa-solid fa-plus" id="structuredprefill_preset_new" title="Create new StructuredPrefill preset"></div>
+                        <div class="menu_button menu_button_icon fa-solid fa-pen-to-square" id="structuredprefill_preset_rename" title="Rename active StructuredPrefill preset"></div>
+                        <div class="menu_button menu_button_icon fa-solid fa-file-import" id="structuredprefill_preset_import" title="Import StructuredPrefill preset"></div>
+                        <input type="file" id="structuredprefill_preset_import_file" accept=".json" hidden>
+                        <div class="menu_button menu_button_icon fa-solid fa-file-export" id="structuredprefill_preset_export" title="Export active StructuredPrefill preset"></div>
+                        <div class="menu_button menu_button_icon fa-solid fa-trash redWarningBG" id="structuredprefill_preset_delete" title="Delete active StructuredPrefill preset"></div>
+                    </div>
+                    <small>Presets store StructuredPrefill behavior, prefill override text, anti-slop, and prefill-generator settings.</small>
+                </div>
+            </div>
+
+            <div class="structuredprefill-settings-group inline-drawer">
+                <div class="inline-drawer-toggle inline-drawer-header structuredprefill-section-toggle">
                     <span class="structuredprefill-section-label">General</span>
                     <div class="inline-drawer-icon fa-solid fa-circle-chevron-up up"></div>
                 </div>
@@ -25,6 +45,28 @@
                             <input type="checkbox" id="structuredprefill_hide_prefill_in_display">
                             <small>Hide prefill text in the final message (use <code>[[keep]]</code> to keep only the tail visible)</small>
                         </label>
+                    </div>
+                </div>
+            </div>
+
+            <div class="structuredprefill-settings-group inline-drawer">
+                <div class="inline-drawer-toggle inline-drawer-header structuredprefill-section-toggle">
+                    <span class="structuredprefill-section-label">Prefill Override</span>
+                    <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+                </div>
+
+                <div class="inline-drawer-content structuredprefill-section-content">
+                    <div class="flex-container">
+                        <label class="flex-container">
+                            <input type="checkbox" id="structuredprefill_override_prefill_enabled">
+                            <small>Use this preset's prefill instead of Prompt Manager / assistant prefill</small>
+                        </label>
+                    </div>
+
+                    <div class="flex-container flexFlowColumn">
+                        <label for="structuredprefill_override_prefill_text">Structured prefill text</label>
+                        <textarea id="structuredprefill_override_prefill_text" class="text_pole" rows="6" autocomplete="off" placeholder="[here is the response:]"></textarea>
+                        <small>If no assistant prefill exists, StructuredPrefill appends this one for the outgoing request. If one already exists, it is replaced by this preset value.</small>
                     </div>
                 </div>
             </div>
