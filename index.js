@@ -7,6 +7,13 @@ const { eventSource, event_types, renderExtensionTemplateAsync, callPopup } = Si
 
 const extensionName = 'StructuredPrefill';
 const extensionPath = 'third-party/StructuredPrefill';
+const STREAM_MARKDOWN_FAST_INTERVAL_MS = 90;
+const STREAM_MARKDOWN_LARGE_INTERVAL_MS = 180;
+const STREAM_MARKDOWN_HUGE_INTERVAL_MS = 320;
+const STREAM_MARKDOWN_LARGE_CHARS = 6000;
+const STREAM_MARKDOWN_HUGE_CHARS = 12000;
+const STREAM_PLAIN_TEXT_EMERGENCY_CHARS = 25000;
+const STREAM_UNCLOSED_FENCE_PLAIN_TEXT_THRESHOLD = 12000;
 
 const defaultPresetSettings = {
     hide_prefill_in_display: true,
@@ -85,6 +92,9 @@ const runtimeState = {
     trackedSwipeId: -1,
     applyingDom: 0,
     postFrameQueued: false,
+    lastStreamingMarkdownAt: 0,
+    lastStreamingHtml: '',
+    lastStreamingHtmlMessageId: -1,
     userScrollLocked: false,
     lastUserScrollIntentAt: 0,
     scrollIntentListenersAttached: false,
@@ -826,6 +836,9 @@ function resetStreamGuard() {
     runtimeState.streamGuard.lastProgressAt = Date.now();
     runtimeState.streamGuard.suspiciousStreak = 0;
     runtimeState.streamGuard.stopRequested = false;
+    runtimeState.lastStreamingMarkdownAt = 0;
+    runtimeState.lastStreamingHtml = '';
+    runtimeState.lastStreamingHtmlMessageId = -1;
 }
 
 function showGuardToast(message) {
@@ -903,6 +916,7 @@ function isSuspiciousPaddingDelta(delta) {
 
 function maybeAbortOnStreamLoop(rawText, decodedFullText) {
     if (!runtimeState.active) return;
+    if (runtimeState.stopping) return;
     if (runtimeState.streamGuard.stopRequested) return;
 
     const rawLen = String(rawText ?? '').length;
@@ -2398,6 +2412,38 @@ function sanitizeUnclosedCodeFencesForPreview(text) {
     return out;
 }
 
+function getStreamingMarkdownIntervalMs(displayText) {
+    const text = String(displayText ?? '');
+    if (text.length >= STREAM_MARKDOWN_HUGE_CHARS) {
+        return STREAM_MARKDOWN_HUGE_INTERVAL_MS;
+    }
+    if (text.length >= STREAM_MARKDOWN_LARGE_CHARS) {
+        return STREAM_MARKDOWN_LARGE_INTERVAL_MS;
+    }
+    return STREAM_MARKDOWN_FAST_INTERVAL_MS;
+}
+
+function shouldUseEmergencyPlainTextStreamingPreview(displayText) {
+    const text = String(displayText ?? '');
+    if (!text) return false;
+
+    if (text.length >= STREAM_PLAIN_TEXT_EMERGENCY_CHARS) {
+        return true;
+    }
+
+    if (text.length >= STREAM_UNCLOSED_FENCE_PLAIN_TEXT_THRESHOLD && hasUnclosedCodeFence(text)) {
+        return true;
+    }
+
+    return false;
+}
+
+function shouldDeferStreamingMarkdownRender(displayText) {
+    const now = typeof performance?.now === 'function' ? performance.now() : Date.now();
+    const sinceLastMarkdown = now - (runtimeState.lastStreamingMarkdownAt || 0);
+    return sinceLastMarkdown < getStreamingMarkdownIntervalMs(displayText);
+}
+
 function applyTextToMessageStreaming(messageId, newText) {
     if (typeof messageId !== 'number' || messageId < 0 || messageId >= chat.length) return;
     const message = chat[messageId];
@@ -2443,22 +2489,31 @@ function applyTextToMessageStreaming(messageId, newText) {
     if (textEl instanceof HTMLElement) {
         runtimeState.applyingDom++;
         try {
-            // SAFEGUARD:
-            // Rendering markdown on every token can be expensive. This was especially crashy when the model emitted
-            // an *unclosed* code fence like ```json{ mid-stream.
-            //
-            // Instead of falling back to plain text (which breaks quote-highlighting + regex formatting), we keep
-            // `messageFormatting()` during streaming but "break" the last unmatched fence marker for preview only.
-            // This avoids visible junk being appended to the message (no trailing ~~~), and keeps visuals consistent.
-            const isHuge = displayText.length > 80000;
-            const previewText = hasUnclosedCodeFence(displayText) ? sanitizeUnclosedCodeFencesForPreview(displayText) : displayText;
+            const useEmergencyPlainPreview = shouldUseEmergencyPlainTextStreamingPreview(displayText);
+            const reuseFormattedPreview = !useEmergencyPlainPreview
+                && shouldDeferStreamingMarkdownRender(displayText)
+                && runtimeState.lastStreamingHtmlMessageId === messageId
+                && typeof runtimeState.lastStreamingHtml === 'string'
+                && runtimeState.lastStreamingHtml.length > 0;
 
-            if (isHuge) {
-                // Preserve newlines even when we temporarily bypass the markdown pipeline.
+            if (useEmergencyPlainPreview) {
+                // Catastrophic-safety path only. The final render still goes through ST's normal markdown
+                // pipeline when the message is finalized.
                 textEl.style.whiteSpace = 'pre-wrap';
                 textEl.textContent = displayText;
-            } else {
+            } else if (reuseFormattedPreview) {
+                // Keep the last fully formatted native-ST preview visible until enough time has passed to
+                // justify re-running the markdown/regex pipeline on the whole accumulated message.
                 textEl.style.whiteSpace = '';
+                if (textEl.innerHTML !== runtimeState.lastStreamingHtml) {
+                    textEl.innerHTML = runtimeState.lastStreamingHtml;
+                }
+            } else {
+                // For the streaming chunks we do format, sanitize unmatched code fences so partially
+                // emitted fences do not explode the markdown parser mid-stream.
+                const previewText = hasUnclosedCodeFence(displayText) ? sanitizeUnclosedCodeFencesForPreview(displayText) : displayText;
+                textEl.style.whiteSpace = '';
+                runtimeState.lastStreamingMarkdownAt = typeof performance?.now === 'function' ? performance.now() : Date.now();
                 const formatted = messageFormatting(
                     previewText,
                     message?.name ?? '',
@@ -2468,6 +2523,8 @@ function applyTextToMessageStreaming(messageId, newText) {
                     {},
                     false,
                 );
+                runtimeState.lastStreamingHtml = formatted;
+                runtimeState.lastStreamingHtmlMessageId = messageId;
                 textEl.innerHTML = formatted;
             }
         } catch (err) {
@@ -2532,7 +2589,7 @@ function scheduleDecodedRender(messageId) {
     if (runtimeState.renderQueued) return;
     runtimeState.renderQueued = true;
 
-    queueMicrotask(() => {
+    requestAnimationFrame(() => {
         runtimeState.renderQueued = false;
         // Ensure we're still looking at the same message.
         if (!runtimeState.active) return;
@@ -2995,17 +3052,15 @@ function scheduleStreamUnwrap(rawText) {
 
     runtimeState.latestStreamText = String(rawText ?? '');
     const messageId = getActiveAssistantMessageIdForStreaming();
-    // Reduce flicker: decode immediately and replace raw JSON before ST paints it for long.
+    // Keep the best-known decoded value up to date, but collapse actual DOM work into the
+    // scheduled render path so stream chunks and observer churn paint at most once per frame.
     try {
         const rawStr = String(rawText ?? '');
         const unwrapped = tryUnwrapStructuredOutput(rawStr);
         if (typeof unwrapped === 'string') {
             runtimeState.lastAppliedText = unwrapped;
-            applyTextToMessageStreaming(messageId, unwrapped);
         } else if (rawStr.trimStart().startsWith('{')) {
-            // If we can't extract yet (very early tokens), never show raw JSON.
-            const fallback = typeof runtimeState.lastAppliedText === 'string' ? runtimeState.lastAppliedText : '';
-            applyTextToMessageStreaming(messageId, fallback);
+            runtimeState.lastAppliedText = typeof runtimeState.lastAppliedText === 'string' ? runtimeState.lastAppliedText : '';
         }
     } catch {
         // ignore
