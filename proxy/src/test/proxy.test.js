@@ -107,6 +107,57 @@ test('anti-slop regex shape matches the extension for anthropic-safe simple bans
     );
 });
 
+test('anthropic rewrites keep exact unicode prefills and still hide the [[keep]] prefix', () => {
+    const targetUrl = new URL('https://api.anthropic.com/v1/messages');
+    const prefix = '｡•̀ᴗ✧áßðäåéæ©生と[[keep]]Visible: ';
+    const visibleText = 'Visible: hello';
+    const fullText = '｡•̀ᴗ✧áßðäåéæ©生とVisible: hello';
+    const wrongPrefixText = 'x•̀ᴗ✧áßðäåéæ©生とVisible: hello';
+    const body = {
+        model: 'claude-sonnet-4-5',
+        max_tokens: 128,
+        messages: [
+            { role: 'user', content: 'Continue.' },
+            { role: 'assistant', content: prefix },
+        ],
+    };
+
+    const rewrittenRequest = rewriteProxyJsonRequest({
+        targetUrl,
+        jsonBody: body,
+        baseConfig: {
+            enabled: true,
+            minCharsAfterPrefix: 1,
+            newlineToken: '<NL>',
+            hidePrefillInDisplay: true,
+        },
+    });
+
+    const pattern = new RegExp(rewrittenRequest.context.responseSchema.properties.response.pattern);
+    assert.equal(pattern.test(fullText), true);
+    assert.equal(pattern.test(wrongPrefixText), false);
+
+    const rewrittenResponse = rewriteProxyJsonResponse({
+        context: rewrittenRequest.context,
+        jsonBody: {
+            type: 'message',
+            role: 'assistant',
+            stop_reason: 'tool_use',
+            content: [
+                {
+                    type: 'tool_use',
+                    name: 'response',
+                    input: {
+                        response: fullText,
+                    },
+                },
+            ],
+        },
+    });
+
+    assert.deepEqual(rewrittenResponse.content, [{ type: 'text', text: visibleText }]);
+});
+
 test('openai chat requests are rewritten into response_format json_schema', () => {
     const targetUrl = new URL('https://api.openai.com/v1/chat/completions');
     const body = {

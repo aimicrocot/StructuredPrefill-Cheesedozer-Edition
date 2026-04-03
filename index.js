@@ -1072,23 +1072,6 @@ function buildContinueOverlapStripper(overlapText) {
     // Overlap is treated as a literal (no slots).
     runtimeState.continue.overlapStripLiteral = normalized;
     runtimeState.continue.overlapStripRegex = null;
-
-    // For Anthropic mode, non-ASCII characters in the overlap get replaced with `.` in the
-    // schema pattern.  The model can then output *any* character in those positions, so a
-    // literal startsWith check would fail.  Build a regex that mirrors the same replacement
-    // so the stripper still matches.
-    // eslint-disable-next-line no-control-regex
-    if (runtimeState.patternMode === 'anthropic' && /[^\x00-\x7F]/.test(normalized)) {
-        try {
-            const regexSrc = normalized.split('').map(ch =>
-                // eslint-disable-next-line no-control-regex
-                /[^\x00-\x7F]/.test(ch) ? '.' : escapeRegExp(ch),
-            ).join('');
-            runtimeState.continue.overlapStripRegex = new RegExp(`^(${regexSrc})`);
-        } catch {
-            // Fall back to literal
-        }
-    }
 }
 
 function stripContinueOverlapPrefix(text) {
@@ -1524,6 +1507,24 @@ function anyCharIncludingNewlineExpr() {
     return '(?:.|\\n)';
 }
 
+function escapeRegexSourceForAsciiPattern(source) {
+    const value = String(source ?? '');
+    let out = '';
+
+    for (let i = 0; i < value.length; i++) {
+        const codeUnit = value.charCodeAt(i);
+        if (codeUnit <= 0x7F) {
+            out += value[i];
+            continue;
+        }
+
+        // Escape UTF-16 code units so astral characters stay intact as surrogate pairs.
+        out += `\\u${codeUnit.toString(16).toUpperCase().padStart(4, '0')}`;
+    }
+
+    return out;
+}
+
 function getPatternModeForRequest(source, modelId) {
     const src = String(source ?? '').toLowerCase();
     const model = String(modelId ?? '').toLowerCase();
@@ -1924,11 +1925,10 @@ function buildJsonSchemaForPrefillValuePattern(prefix, minCharsAfterPrefix, join
     }
 
     // Anthropic's structured-output regex validator only accepts ASCII patterns and rejects
-    // shorthand character classes like `\s`, `\S`. Replace non-ASCII characters with `.`
-    // (any-char wildcard) so the pattern is accepted.
+    // shorthand character classes like `\s`, `\S`. Escape non-ASCII code units as `\uXXXX`
+    // so the pattern stays ASCII without weakening the enforced prefill.
     if (runtimeState.patternMode === 'anthropic') {
-        // eslint-disable-next-line no-control-regex
-        prefixRegex = prefixRegex.replace(/[^\x00-\x7F]/g, '.');
+        prefixRegex = escapeRegexSourceForAsciiPattern(prefixRegex);
     }
 
     // Append raw join-suffix regex (e.g. `[^A-Z]`) for Continue flows.

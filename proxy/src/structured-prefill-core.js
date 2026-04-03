@@ -103,6 +103,23 @@ function anyCharIncludingNewlineExpr() {
     return '(?:.|\\n)';
 }
 
+function escapeRegexSourceForAsciiPattern(source) {
+    const value = String(source ?? '');
+    let out = '';
+
+    for (let i = 0; i < value.length; i++) {
+        const codeUnit = value.charCodeAt(i);
+        if (codeUnit <= 0x7F) {
+            out += value[i];
+            continue;
+        }
+
+        out += `\\u${codeUnit.toString(16).toUpperCase().padStart(4, '0')}`;
+    }
+
+    return out;
+}
+
 function splitHintSuffix(placeholderBody) {
     const body = String(placeholderBody ?? '');
     const index = body.toLowerCase().lastIndexOf('|hint:');
@@ -455,7 +472,7 @@ function buildPatternResponseSchema(prefix, opts = {}) {
     }
 
     if (patternMode === 'anthropic') {
-        prefixRegex = prefixRegex.replace(/[^\x00-\x7F]/g, '.');
+        prefixRegex = escapeRegexSourceForAsciiPattern(prefixRegex);
     }
 
     if (joinSuffixRegex) {
@@ -695,18 +712,6 @@ function buildStripState(prefixTemplate, context) {
 function buildContinueOverlapStripState(overlapText, context) {
     const normalized = normalizeNewlines(overlapText);
     if (!normalized) return { literal: '', regex: null };
-
-    if (context?.patternMode === 'anthropic' && /[^\x00-\x7F]/.test(normalized)) {
-        try {
-            const regexSrc = normalized.split('').map((ch) => /[^\x00-\x7F]/.test(ch) ? '.' : escapeRegExp(ch)).join('');
-            return {
-                literal: normalized,
-                regex: new RegExp(`^(${regexSrc})`),
-            };
-        } catch {
-            return { literal: normalized, regex: null };
-        }
-    }
 
     return { literal: normalized, regex: null };
 }
