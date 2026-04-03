@@ -96,8 +96,7 @@ const runtimeState = {
     lastStreamingHtml: '',
     lastStreamingHtmlMessageId: -1,
     userScrollLocked: false,
-    lastUserScrollIntentAt: 0,
-    scrollIntentListenersAttached: false,
+    scrollLockListenersAttached: false,
     streamGuard: {
         startedAt: 0,
         lastRawLen: 0,
@@ -164,14 +163,6 @@ function isChatScrolledToBottom(el, thresholdPx = 5) {
     return Math.abs(el.scrollHeight - el.clientHeight - el.scrollTop) < thresholdPx;
 }
 
-function markUserScrollIntent() {
-    runtimeState.lastUserScrollIntentAt = Date.now();
-}
-
-function userRecentlyIntendedScroll(windowMs = 800) {
-    return Date.now() - (runtimeState.lastUserScrollIntentAt || 0) < windowMs;
-}
-
 function updateUserScrollLockFromScrollEvent() {
     const el = getChatScrollElement();
     if (!el) return;
@@ -184,26 +175,18 @@ function updateUserScrollLockFromScrollEvent() {
         return;
     }
 
-    if (userRecentlyIntendedScroll(800)) {
-        runtimeState.userScrollLocked = true;
-    }
+    runtimeState.userScrollLocked = true;
 }
 
-function ensureScrollIntentListeners() {
-    if (runtimeState.scrollIntentListenersAttached) return;
+function ensureScrollLockListeners() {
+    if (runtimeState.scrollLockListenersAttached) return;
     const el = getChatScrollElement();
     if (!el) return;
 
-    runtimeState.scrollIntentListenersAttached = true;
-
-    el.addEventListener('wheel', markUserScrollIntent, { passive: true });
-    el.addEventListener('touchstart', markUserScrollIntent, { passive: true });
-    el.addEventListener('touchmove', markUserScrollIntent, { passive: true });
-    el.addEventListener('pointerdown', markUserScrollIntent, { passive: true });
-    el.addEventListener('mousedown', markUserScrollIntent, { passive: true });
+    runtimeState.scrollLockListenersAttached = true;
     el.addEventListener('scroll', updateUserScrollLockFromScrollEvent, { passive: true });
 
-    // Initialize lock state based on current scroll position.
+    // Mirror native ST: autoscroll stays unlocked only while the chat is already at bottom.
     runtimeState.userScrollLocked = !isChatScrolledToBottom(el, 5);
 }
 
@@ -2464,7 +2447,7 @@ function applyTextToMessageStreaming(messageId, newText) {
         return;
     }
 
-    ensureScrollIntentListeners();
+    ensureScrollLockListeners();
 
     const displayText = computeDisplayText(messageId, newText);
 
@@ -3326,7 +3309,7 @@ jQuery(async () => {
     loadSettings();
     renderSettingsToUi();
     setupUiListeners();
-    ensureScrollIntentListeners();
+    ensureScrollLockListeners();
 
     eventSource.on(event_types.CHAT_COMPLETION_SETTINGS_READY, onChatCompletionSettingsReady);
     eventSource.on(event_types.CONNECTION_PROFILE_LOADED, renderPrefillGenProfileSelect);
