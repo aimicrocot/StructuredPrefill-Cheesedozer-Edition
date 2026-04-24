@@ -712,13 +712,15 @@ async function runPrefillGeneratorOrEmpty({
             throw new Error(`Prefill generator: ${msg}`);
         }
 
-        const generatedText = extractPlainTextFromCompletionResponse(data);
-        if (!keepMatchedStopString) {
-            return generatedText;
+        let generatedText = extractPlainTextFromCompletionResponse(data);
+        if (keepMatchedStopString) {
+            const matchedStopString = detectMatchedStopStringFromCompletionResponse(data, normalizedStopStrings);
+            generatedText = appendMatchedStopString(generatedText, matchedStopString);
         }
 
-        const matchedStopString = detectMatchedStopStringFromCompletionResponse(data, normalizedStopStrings);
-        return appendMatchedStopString(generatedText, matchedStopString);
+        // Prefill-generator output becomes part of the enforced prefix. Normalize smart punctuation
+        // and leaked unicode-escape remnants up front so downstream providers do not echo `u2014`-style junk.
+        return sanitizePrefillGeneratorText(generatedText);
     } catch (error) {
         if (error?.name === 'AbortError' && controller.signal.aborted) {
             throw new Error(`Prefill generator timed out after ${configuredTimeoutMs} ms.`);
@@ -755,6 +757,117 @@ function supportsStructuredPrefillForSource(chatCompletionSource) {
 
 function normalizeNewlines(text) {
     return String(text ?? '').replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+}
+
+const STRUCTURED_PREFILL_ASCII_ESCAPE_REPLACEMENTS = Object.freeze({
+    '00a0': ' ',
+    '00ad': '',
+    '2010': '-',
+    '2011': '-',
+    '2012': '-',
+    '2013': '-',
+    '2014': '-',
+    '2015': '-',
+    '2018': '\'',
+    '2019': '\'',
+    '201a': '\'',
+    '201b': '\'',
+    '201c': '"',
+    '201d': '"',
+    '201e': '"',
+    '201f': '"',
+    '2026': '...',
+    '2212': '-',
+});
+
+const STRUCTURED_PREFILL_DISPLAY_ESCAPE_REPLACEMENTS = Object.freeze({
+    '00a0': ' ',
+    '00ad': '',
+    '2010': '\u2010',
+    '2011': '\u2011',
+    '2012': '\u2012',
+    '2013': '\u2013',
+    '2014': '\u2014',
+    '2015': '\u2015',
+    '2018': '\'',
+    '2019': '\'',
+    '201a': '\'',
+    '201b': '\'',
+    '201c': '"',
+    '201d': '"',
+    '201e': '"',
+    '201f': '"',
+    '2026': '\u2026',
+    '2212': '\u2212',
+});
+
+function replaceCommonUnicodePunctuationWithAscii(text) {
+    const input = String(text ?? '');
+    let out = '';
+
+    for (let i = 0; i < input.length; i++) {
+        const ch = input[i];
+        switch (ch) {
+            case '\u00A0': out += ' '; break;
+            case '\u00AD': break;
+            case '\u2010':
+            case '\u2011':
+            case '\u2012':
+            case '\u2013':
+            case '\u2014':
+            case '\u2015':
+            case '\u2212':
+                out += '-';
+                break;
+            case '\u2018':
+            case '\u2019':
+            case '\u201A':
+            case '\u201B':
+                out += '\'';
+                break;
+            case '\u201C':
+            case '\u201D':
+            case '\u201E':
+            case '\u201F':
+                out += '"';
+                break;
+            case '\u2026':
+                out += '...';
+                break;
+            default:
+                out += ch;
+                break;
+        }
+    }
+
+    return out;
+}
+
+// Some providers leak smart-punctuation escapes as visible text while streaming, e.g. `u2014` or `\u2019`.
+// Repair only a narrow allowlist so normal prose is left alone.
+function repairVisibleUnicodeEscapeArtifacts(text, replacements = STRUCTURED_PREFILL_DISPLAY_ESCAPE_REPLACEMENTS) {
+    return String(text ?? '').replace(
+        /\\*u(00a0|00ad|2010|2011|2012|2013|2014|2015|2018|2019|201a|201b|201c|201d|201e|201f|2026|2212)/gi,
+        (match, code) => {
+            const replacement = replacements[String(code ?? '').toLowerCase()];
+            return typeof replacement === 'string' ? replacement : match;
+        },
+    );
+}
+
+function normalizeStructuredPrefillUnicodeArtifacts(text) {
+    return repairVisibleUnicodeEscapeArtifacts(
+        replaceCommonUnicodePunctuationWithAscii(text),
+        STRUCTURED_PREFILL_ASCII_ESCAPE_REPLACEMENTS,
+    );
+}
+
+function decodeStructuredPrefillText(text, newlineToken) {
+    return repairVisibleUnicodeEscapeArtifacts(straightenCurlyQuotes(decodeNewlines(text, newlineToken)));
+}
+
+function sanitizePrefillGeneratorText(text) {
+    return normalizeStructuredPrefillUnicodeArtifacts(normalizeNewlines(text));
 }
 
 function getOverridePrefillText(settings = extension_settings[extensionName]) {
@@ -854,7 +967,7 @@ function tryStopGeneration() {
 function getDecodedValueForGuard(rawText) {
     // Guard uses the *full* decoded value (before "hide prefill text") so we don't falsely detect "no progress"
     // while the model is still streaming the hidden prefix.
-    const decode = (s) => decodeNewlines(s, runtimeState.newlineToken);
+    const decode = (s) => decodeStructuredPrefillText(s, runtimeState.newlineToken);
     try {
         const parsed = JSON.parse(String(rawText ?? ''));
         if (parsed && typeof parsed === 'object') {
@@ -2187,7 +2300,7 @@ function straightenCurlyQuotes(s) {
 function tryUnwrapStructuredOutput(text) {
     if (typeof text !== 'string' || text.length === 0) return null;
 
-    const decode = (s) => straightenCurlyQuotes(decodeNewlines(s, runtimeState.newlineToken));
+    const decode = (s) => decodeStructuredPrefillText(s, runtimeState.newlineToken);
     const applyContinueJoin = (decodedValue) => {
         // Continue can carry prompt-manager prefills that should not be re-added to the message.
         // Strip those first, then perform the normal "append to base" join.
@@ -2244,7 +2357,7 @@ function tryUnwrapStructuredOutput(text) {
                 return runtimeState.continue.active ? applyContinueJoin(joined) : joined;
             }
             // Back-compat with the previous multi-field attempt.
-            if (typeof parsed.content === 'string') return String(runtimeState.expectedPrefill ?? '') + parsed.content;
+            if (typeof parsed.content === 'string') return String(runtimeState.expectedPrefill ?? '') + decode(parsed.content);
         }
     } catch {
         // JSON.parse failed. Some providers/models still *mostly* follow the schema but emit invalid JSON,
@@ -2295,7 +2408,7 @@ function tryUnwrapStructuredOutput(text) {
 
     // Back-compat with the previous multi-field attempt.
     const content = tryExtractJsonStringField(text, 'content');
-    if (typeof content === 'string') return String(runtimeState.expectedPrefill ?? '') + content;
+    if (typeof content === 'string') return String(runtimeState.expectedPrefill ?? '') + decode(content);
     return null;
 }
 

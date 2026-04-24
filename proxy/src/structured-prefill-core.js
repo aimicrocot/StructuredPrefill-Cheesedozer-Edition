@@ -36,6 +36,107 @@ function normalizeNewlines(text) {
     return String(text ?? '').replace(/\r\n/g, '\n').replace(/\r/g, '\n');
 }
 
+const STRUCTURED_PREFILL_ASCII_ESCAPE_REPLACEMENTS = Object.freeze({
+    '00a0': ' ',
+    '00ad': '',
+    '2010': '-',
+    '2011': '-',
+    '2012': '-',
+    '2013': '-',
+    '2014': '-',
+    '2015': '-',
+    '2018': '\'',
+    '2019': '\'',
+    '201a': '\'',
+    '201b': '\'',
+    '201c': '"',
+    '201d': '"',
+    '201e': '"',
+    '201f': '"',
+    '2026': '...',
+    '2212': '-',
+});
+
+const STRUCTURED_PREFILL_DISPLAY_ESCAPE_REPLACEMENTS = Object.freeze({
+    '00a0': ' ',
+    '00ad': '',
+    '2010': '\u2010',
+    '2011': '\u2011',
+    '2012': '\u2012',
+    '2013': '\u2013',
+    '2014': '\u2014',
+    '2015': '\u2015',
+    '2018': '\'',
+    '2019': '\'',
+    '201a': '\'',
+    '201b': '\'',
+    '201c': '"',
+    '201d': '"',
+    '201e': '"',
+    '201f': '"',
+    '2026': '\u2026',
+    '2212': '\u2212',
+});
+
+function replaceCommonUnicodePunctuationWithAscii(text) {
+    const input = String(text ?? '');
+    let out = '';
+
+    for (let i = 0; i < input.length; i++) {
+        const ch = input[i];
+        switch (ch) {
+            case '\u00A0': out += ' '; break;
+            case '\u00AD': break;
+            case '\u2010':
+            case '\u2011':
+            case '\u2012':
+            case '\u2013':
+            case '\u2014':
+            case '\u2015':
+            case '\u2212':
+                out += '-';
+                break;
+            case '\u2018':
+            case '\u2019':
+            case '\u201A':
+            case '\u201B':
+                out += '\'';
+                break;
+            case '\u201C':
+            case '\u201D':
+            case '\u201E':
+            case '\u201F':
+                out += '"';
+                break;
+            case '\u2026':
+                out += '...';
+                break;
+            default:
+                out += ch;
+                break;
+        }
+    }
+
+    return out;
+}
+
+function repairVisibleUnicodeEscapeArtifacts(text, replacements = STRUCTURED_PREFILL_DISPLAY_ESCAPE_REPLACEMENTS) {
+    return String(text ?? '').replace(
+        /\\*u(00a0|00ad|2010|2011|2012|2013|2014|2015|2018|2019|201a|201b|201c|201d|201e|201f|2026|2212)/gi,
+        (match, code) => {
+            const replacement = replacements[String(code ?? '').toLowerCase()];
+            return typeof replacement === 'string' ? replacement : match;
+        },
+    );
+}
+
+function normalizeStructuredPrefillUnicodeArtifacts(text) {
+    return repairVisibleUnicodeEscapeArtifacts(
+        replaceCommonUnicodePunctuationWithAscii(text),
+        STRUCTURED_PREFILL_ASCII_ESCAPE_REPLACEMENTS,
+    );
+}
+
 function prefixHasSlots(prefix) {
     return /\[\[[^\]]+?\]\]/.test(String(prefix ?? ''));
 }
@@ -598,9 +699,9 @@ function flattenSchemaForProvider(schema, provider) {
 
 function decodeStructuredText(text, context) {
     if (context.schemaMode === 'enum_prefix' || context.schemaMode === 'enum_exact') {
-        return String(text ?? '');
+        return repairVisibleUnicodeEscapeArtifacts(String(text ?? ''));
     }
-    return straightenCurlyQuotes(decodeNewlines(text, context.newlineToken));
+    return repairVisibleUnicodeEscapeArtifacts(straightenCurlyQuotes(decodeNewlines(text, context.newlineToken)));
 }
 
 function applyDisplayHiding(text, context) {
@@ -2048,6 +2149,7 @@ module.exports = {
     createUsageText,
     decodeNewlines,
     encodeNewlines,
+    normalizeStructuredPrefillUnicodeArtifacts,
     prefixHasSlots,
     rewriteProxyJsonRequest,
     rewriteProxyJsonResponse,

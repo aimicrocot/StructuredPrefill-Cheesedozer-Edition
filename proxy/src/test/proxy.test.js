@@ -1071,6 +1071,16 @@ test('tolerant unwrapping survives invalid JSON quotes', () => {
     assert.equal(unwrapped, 'She said "hello" and left');
 });
 
+test('unwrapping repairs leaked unicode punctuation escape remnants', () => {
+    const raw = '{"response":"Wait\u2014really? The hoodie was long goneu2014somewhere. He didn\\\\u2019t look back. \u201CHi\u201D..."}';
+    const unwrapped = tryUnwrapStructuredOutput(raw, {
+        schemaMode: 'pattern',
+        newlineToken: '<NL>',
+    });
+
+    assert.equal(unwrapped, 'Wait\u2014really? The hoodie was long gone\u2014somewhere. He didn\'t look back. "Hi"...');
+});
+
 test('hide_prefill_in_display strips the hidden prefix and keeps the visible tail', () => {
     const targetUrl = new URL('https://api.openai.com/v1/chat/completions');
     const body = {
@@ -1444,6 +1454,51 @@ test('prefill generator replaces [[pg]] in openai chat requests using the same u
     assert.equal(rewritten.debug.requestBody.model, 'gpt-4o-mini');
     assert.equal(rewritten.debug.generatedText, 'brooding');
     assert.equal(rewritten.jsonBody.messages[1].content, 'Mood: brooding\nScene: ');
+});
+
+test('prefill generator normalizes smart punctuation and leaked unicode escapes before splicing', async () => {
+    const targetUrl = new URL('https://api.openai.com/v1/chat/completions');
+    const body = {
+        model: 'gpt-4o-mini',
+        messages: [
+            { role: 'user', content: 'Write the opener.' },
+            { role: 'assistant', content: 'Mood: [[pg]]\nScene: ' },
+        ],
+    };
+
+    const rewritten = await applyPrefillGeneratorToRequest({
+        targetUrl,
+        jsonBody: body,
+        upstreamHeaders: new Headers({ authorization: 'Bearer test' }),
+        config: {
+            enabled: true,
+            model: '',
+            maxTokens: 12,
+            timeoutMs: 5000,
+            stopStrings: [],
+            keepMatchedStopString: false,
+            extraPrompt: '',
+            extraPromptRole: 'system',
+        },
+        fetchImpl: async () => {
+            return new Response(JSON.stringify({
+                choices: [
+                    {
+                        message: {
+                            role: 'assistant',
+                            content: '\u201Cbrooding\u201D u2014 didn\\u2019t',
+                        },
+                    },
+                ],
+            }), {
+                status: 200,
+                headers: { 'content-type': 'application/json' },
+            });
+        },
+    });
+
+    assert.equal(rewritten.debug.generatedText, '"brooding" - didn\'t');
+    assert.equal(rewritten.jsonBody.messages[1].content, 'Mood: "brooding" - didn\'t\nScene: ');
 });
 
 test('prefill generator can use a separate anthropic target and api key', async () => {
