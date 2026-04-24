@@ -1,5 +1,7 @@
 'use strict';
 
+const { normalizeStructuredPrefillUnicodeArtifacts } = require('./structured-prefill-core');
+
 const PREFILL_GEN_SLOT_REGEX = /\[\[\s*pg\s*\]\]/gi;
 
 function cloneJson(value) {
@@ -1009,6 +1011,7 @@ async function applyPrefillGeneratorToRequest({
     } else {
         debug.reason = 'disabled';
     }
+    generatedText = normalizeStructuredPrefillUnicodeArtifacts(generatedText);
     debug.generatedText = generatedText;
 
     const nextPrefill = String(target.prefill ?? '').replace(PREFILL_GEN_SLOT_REGEX, String(generatedText ?? ''));
