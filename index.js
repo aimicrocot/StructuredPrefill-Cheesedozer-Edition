@@ -1,5 +1,10 @@
 import { chat, getRequestHeaders, messageFormatting, saveSettingsDebounced, scrollChatToBottom, updateMessageBlock } from '../../../../script.js';
 import { extension_settings } from '../../../extensions.js';
+import { ARGUMENT_TYPE, SlashCommandArgument } from '../../../slash-commands/SlashCommandArgument.js';
+import { enumIcons } from '../../../slash-commands/SlashCommandCommonEnumsProvider.js';
+import { SlashCommand } from '../../../slash-commands/SlashCommand.js';
+import { SlashCommandEnumValue, enumTypes } from '../../../slash-commands/SlashCommandEnumValue.js';
+import { SlashCommandParser } from '../../../slash-commands/SlashCommandParser.js';
 import { getRegexedString, regex_placement } from '../../regex/engine.js';
 import { download, getFileText } from '../../../utils.js';
 
@@ -317,6 +322,35 @@ function refreshPresetList() {
     $presetList.val(settings.active_preset);
 }
 
+function findPresetIndexByName(name, settings = extension_settings[extensionName]) {
+    const lookup = String(name ?? '').trim();
+    if (!lookup || !Array.isArray(settings?.presets)) {
+        return -1;
+    }
+
+    const exactIndex = settings.presets.findIndex(preset => preset.name === lookup);
+    if (exactIndex !== -1) {
+        return exactIndex;
+    }
+
+    const normalizedLookup = lookup.toLocaleLowerCase();
+    return settings.presets.findIndex(preset => String(preset.name ?? '').toLocaleLowerCase() === normalizedLookup);
+}
+
+function getPresetEnumValues() {
+    const settings = extension_settings[extensionName];
+    const activeIndex = clampInt(settings?.active_preset_idx, 0, Math.max((settings?.presets?.length ?? 1) - 1, 0), 0);
+
+    return Array.isArray(settings?.presets)
+        ? settings.presets.map((preset, index) => new SlashCommandEnumValue(
+            preset.name,
+            index === activeIndex ? 'Active StructuredPrefill preset' : 'StructuredPrefill preset',
+            enumTypes.enum,
+            enumIcons.preset,
+        ))
+        : [];
+}
+
 function setPresetSetting(key, value, { rerender = false } = {}) {
     const settings = extension_settings[extensionName];
     settings[key] = value;
@@ -337,6 +371,42 @@ function changePreset(idx) {
     applyPresetToRuntimeSettings(settings.presets[nextIdx]);
     renderSettingsToUi();
     saveSettingsDebounced();
+}
+
+function registerSlashCommands() {
+    SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+        name: 'structuredprefill-preset',
+        aliases: ['sp-preset'],
+        callback: (_, presetName) => {
+            const settings = extension_settings[extensionName];
+            const targetIndex = findPresetIndexByName(presetName, settings);
+            if (targetIndex === -1) {
+                toastr.error(`StructuredPrefill preset "${presetName}" not found.`);
+                return '';
+            }
+
+            changePreset(targetIndex);
+            return settings.presets[targetIndex]?.name ?? '';
+        },
+        unnamedArgumentList: [
+            SlashCommandArgument.fromProps({
+                description: 'StructuredPrefill preset name',
+                typeList: [ARGUMENT_TYPE.STRING],
+                isRequired: true,
+                enumProvider: () => getPresetEnumValues(),
+            }),
+        ],
+        returns: ARGUMENT_TYPE.STRING,
+        helpString: 'Change the active StructuredPrefill preset by name.',
+    }));
+
+    SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+        name: 'structuredprefill-preset-list',
+        aliases: ['sp-preset-list'],
+        callback: () => JSON.stringify((extension_settings[extensionName]?.presets ?? []).map(preset => preset.name)),
+        returns: ARGUMENT_TYPE.LIST,
+        helpString: 'List StructuredPrefill preset names as a JSON array.',
+    }));
 }
 
 async function importPreset(file) {
@@ -3422,6 +3492,7 @@ jQuery(async () => {
     loadSettings();
     renderSettingsToUi();
     setupUiListeners();
+    registerSlashCommands();
     ensureScrollLockListeners();
 
     eventSource.on(event_types.CHAT_COMPLETION_SETTINGS_READY, onChatCompletionSettingsReady);
