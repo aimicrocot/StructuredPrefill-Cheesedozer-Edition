@@ -257,7 +257,7 @@ Forces every reply to start with a grounded status block before the actual rolep
 
 #### STRUCTUREDPREFILL PROXY
 
-Want to use StructuredPrefill outside of sillytavern? Look here: https://github.com/mia13165/StructuredPrefill/blob/main/proxy/README.md
+Want to use StructuredPrefill outside of sillytavern? Look here: ./proxy/README.md
 
 
 ![](https://desu-usergeneratedcontent.xyz/g/image/1774/11/1774117299808.png)
