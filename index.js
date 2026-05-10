@@ -820,9 +820,6 @@ function supportsStructuredPrefillForSource(chatCompletionSource) {
     const src = String(chatCompletionSource ?? '').toLowerCase();
     const incompatible = new Set([
         'claude',
-        // OpenAI Responses API uses text.format instead of response_format — json_schema breaks it.
-        // Assistant prefill still works natively via the messages array without this extension.
-        'openai',
         'ai21',
         'deepseek',
         'moonshot',
