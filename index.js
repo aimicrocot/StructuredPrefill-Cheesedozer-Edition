@@ -809,19 +809,18 @@ function supportsStructuredPrefillForSource(chatCompletionSource) {
     // JSON-mode / prompt hacks or forced tooling, which would break this extension’s contract.
     const src = String(chatCompletionSource ?? '').toLowerCase();
     const incompatible = new Set([
-        // Tool-based or non-OpenAI response format.
         'claude',
-        // These providers map `json_schema` to JSON mode / prompt hacks on the server.
+        // OpenAI Responses API uses text.format instead of response_format — json_schema breaks it.
+        // Assistant prefill still works natively via the messages array without this extension.
+        'openai',
         'ai21',
         'deepseek',
         'moonshot',
         'zai',
         'siliconflow',
-        // Currently disabled server-side.
         'cometapi',
         '',
     ]);
-
     return !incompatible.has(src);
 }
 
